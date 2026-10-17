@@ -278,7 +278,7 @@ export class TeamChatBridge {
       },
       update: {},
     });
-    await this.ensureTranscriptMessage(externalMessage, conversation, message.attachments);
+    await this.ensureTranscriptMessage(externalMessage, conversation, message.attachments ?? []);
     if (options?.queueAgent === false) {
       const deferred =
         (externalMessage.status === "deferred" &&
@@ -485,12 +485,35 @@ export class TeamChatBridge {
       userId: string;
       thread: { id: string } | null;
     },
-    attachments: MessagingInboundAttachment[] = [],
+    attachments?: MessagingInboundAttachment[],
   ): Promise<void> {
     if (message.threadMessageId) return;
     if (!conversation.thread) throw new Error("Team chat conversation has no Rakazo thread");
-    const stored = await this.storeAttachments(message.id, conversation, attachments);
-    const text = [message.content.trim(), ...stored.unavailable].filter(Boolean).join("\n");
+    // Fetchers cannot survive a restart; reuse any completed per-file uploads.
+    const stored = attachments
+      ? await this.storeAttachments(message.id, conversation, attachments)
+      : {
+          artifacts: await this.deps.prisma.artifact.findMany({
+            where: {
+              spaceId: conversation.spaceId,
+              userId: conversation.userId,
+              botId: conversation.botId,
+              groupId: null,
+              clientNonce: {
+                in: Array.from(
+                  { length: ATTACHMENT_MAX_COUNT },
+                  (_, index) => `teamchat-attachment:${message.id}:${index}`,
+                ),
+              },
+            },
+            select: { id: true, name: true, mimeType: true, size: true },
+            orderBy: { clientNonce: "asc" },
+          }),
+          unavailable: [],
+        };
+    const text =
+      [message.content.trim(), ...stored.unavailable].filter(Boolean).join("\n") ||
+      (stored.artifacts.length ? "" : "[file (unavailable)]");
     const visible = await this.deps.events.sendUserMessage({
       spaceId: conversation.spaceId,
       threadId: conversation.thread.id,
@@ -995,6 +1018,7 @@ export class TeamChatBridge {
     senderName: string;
     content: string;
     batchContext: string | null;
+    judgedAt?: Date | null;
     engagementReason?: string | null;
     externalConversation: {
       spaceId: string;
@@ -1096,12 +1120,28 @@ export class TeamChatBridge {
     const prompt =
       message.batchContext ??
       teamChatPrompt(this.deps.providerId, message.senderName, message.content);
+    const transcripts = await this.deps.prisma.message.findMany({
+      where: {
+        threadId: thread.id,
+        externalMessage: {
+          OR: [
+            { id: message.id },
+            ...(message.batchContext && message.judgedAt ? [{ judgedAt: message.judgedAt }] : []),
+          ],
+        },
+      },
+      select: { blocks: true },
+      orderBy: { seq: "asc" },
+    });
+    const fileBlocks = transcripts.flatMap(({ blocks }) =>
+      (blocks as MessageBlock[]).filter((block) => block.kind === "file" || block.kind === "image"),
+    );
     const sent = await this.deps.events.sendUserMessage({
       spaceId: message.externalConversation.spaceId,
       threadId: thread.id,
       botId: message.externalConversation.botId,
       userId: message.externalConversation.userId,
-      blocks: [{ kind: "text", text: prompt }],
+      blocks: [{ kind: "text", text: prompt }, ...fileBlocks],
       prompt,
       trigger: "messaging",
       clientNonce: `teamchat:${this.deps.providerId}:${message.providerEventId}`,
