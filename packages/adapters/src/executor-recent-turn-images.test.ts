@@ -225,6 +225,7 @@ async function runWithModel(
       describe: () => ({ capabilities: { graphical: false } }),
       releaseScreen,
       writeFile,
+      readFile: vi.fn().mockRejectedValue(new Error("missing")),
       exportWorkspace,
     },
     home: { commit: vi.fn(async () => "fixture-revision") },

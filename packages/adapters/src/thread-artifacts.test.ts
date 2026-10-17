@@ -5,6 +5,7 @@ import type {
   SandboxProvider,
 } from "@rakazo/adapter-kit";
 import type { MessageBlock } from "@rakazo/contracts";
+import { ATTACHMENT_MAX_COUNT } from "@rakazo/contracts";
 import type { PrismaClient } from "@rakazo/db";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -327,6 +328,136 @@ describe("current-turn thread files", () => {
 });
 
 describe("recent thread files", () => {
+  it.each(["team", "dedicated"] as const)(
+    "preserves edited recent files and lists them in %s mode",
+    async (computerMode) => {
+      const block = {
+        kind: "file" as const,
+        artifactId: "notes",
+        name: "notes.txt",
+        mimeType: "text/plain",
+        size: 8,
+      };
+      const get = vi.fn().mockRejectedValue(new Error("original unavailable"));
+      const readFile = vi.fn().mockResolvedValue(new TextEncoder().encode("edited"));
+      const writeFile = vi.fn();
+      const markWorkspaceDirty = vi.fn();
+      const files = await materializeRecentThreadFiles(
+        {
+          prisma: {
+            artifact: {
+              findMany: vi
+                .fn()
+                .mockResolvedValue([{ ...block, id: "notes", storageKey: "stored" }]),
+            },
+          } as unknown as PrismaClient,
+          artifacts: { get } as unknown as ArtifactStore,
+          sandbox: { readFile, writeFile } as unknown as SandboxProvider,
+        },
+        [{ id: "earlier", role: "user" }],
+        [{ id: "earlier", blocks: [block] }],
+        {
+          context: {
+            operationId: "run",
+            traceId: "run",
+            spaceId: "space",
+            userId: "user",
+            botId: "bot",
+            signal: new AbortController().signal,
+          },
+          computer: { id: "computer", kind: "fake", providerRef: "fake" } as ComputerRef,
+          computerMode,
+          maxTurns: 3,
+          markWorkspaceDirty,
+        },
+      );
+      expect(readFile).toHaveBeenCalledWith(
+        expect.anything(),
+        computerMode === "team" ? "bots/bot/attachments/notes.txt" : "attachments/notes.txt",
+        expect.anything(),
+      );
+      expect(get).not.toHaveBeenCalled();
+      expect(writeFile).not.toHaveBeenCalled();
+      expect(markWorkspaceDirty).not.toHaveBeenCalled();
+      expect(recentThreadFilesInstruction(files)).toContain('"attachments/notes.txt"');
+    },
+  );
+
+  it.each([1, 3])("counts successful files within %s eligible turns", async (maxTurns) => {
+    const block = (id: string): MessageBlock => ({
+      kind: "file",
+      artifactId: id,
+      name: `${id}.txt`,
+      mimeType: "text/plain",
+      size: 3,
+    });
+    const findMany = vi.fn(async ({ where }: { where: { id: { in: string[] } } }) =>
+      where.id.in.map((id) => ({
+        id,
+        name: `${id}.txt`,
+        mimeType: "text/plain",
+        size: 3,
+        storageKey: id,
+      })),
+    );
+    const get = vi.fn(async (id: string) => {
+      if (id.startsWith("missing")) throw new Error("unreadable");
+      return new Uint8Array([1, 2, 3]);
+    });
+    const readFile = vi.fn(async (_computer, path: string) => {
+      if (path.endsWith("existing.txt")) return new Uint8Array();
+      throw new Error("existence check failed");
+    });
+    const writeFile = vi.fn().mockResolvedValue(undefined);
+    const markWorkspaceDirty = vi.fn();
+    const files = await materializeRecentThreadFiles(
+      {
+        prisma: { artifact: { findMany } } as unknown as PrismaClient,
+        artifacts: { get } as unknown as ArtifactStore,
+        sandbox: { readFile, writeFile } as unknown as SandboxProvider,
+      },
+      ["outside", "old", "middle", "new", "current"].map((id) => ({ id, role: "user" })),
+      [
+        { id: "outside", blocks: [block("outside")] },
+        { id: "old", blocks: [block("extra"), block("last")] },
+        { id: "middle", blocks: [block("second"), block("first"), block("existing")] },
+        {
+          id: "new",
+          blocks: Array.from({ length: ATTACHMENT_MAX_COUNT }, (_, i) => block(`missing-${i}`)),
+        },
+        { id: "current", blocks: [block("current")] },
+      ],
+      {
+        context: {
+          operationId: "run",
+          traceId: "run",
+          spaceId: "space",
+          userId: "user",
+          botId: "bot",
+          signal: new AbortController().signal,
+        },
+        computer: { id: "computer", kind: "fake", providerRef: "fake" } as ComputerRef,
+        computerMode: "team",
+        maxTurns,
+        skipMessageId: "current",
+        markWorkspaceDirty,
+      },
+    );
+    expect(files.map((file) => file.name)).toEqual(
+      maxTurns === 1 ? [] : ["existing.txt", "first.txt", "second.txt", "last.txt"],
+    );
+    expect(files).toHaveLength(maxTurns === 1 ? 0 : ATTACHMENT_MAX_COUNT);
+    expect(writeFile).toHaveBeenCalledTimes(maxTurns === 1 ? 0 : 3);
+    expect(markWorkspaceDirty).not.toHaveBeenCalled();
+    expect(get.mock.calls.map(([id]) => id)).toEqual([
+      "missing-3",
+      "missing-2",
+      "missing-1",
+      "missing-0",
+      ...(maxTurns === 1 ? [] : ["first", "second", "last"]),
+    ]);
+  });
+
   it("copies attachments from earlier turns the run is answering, skipping unreadable ones", async () => {
     const findMany = vi.fn(async ({ where }: { where: { id: { in: string[] } } }) =>
       where.id.in[0] === "image-1"
@@ -356,7 +487,10 @@ describe("recent thread files", () => {
         artifacts: {
           get: vi.fn().mockResolvedValue(new Uint8Array([1, 2, 3])),
         } as unknown as ArtifactStore,
-        sandbox: { writeFile } as unknown as SandboxProvider,
+        sandbox: {
+          writeFile,
+          readFile: vi.fn().mockRejectedValue(new Error("missing")),
+        } as unknown as SandboxProvider,
       },
       [
         { id: "transcript-image", role: "user" },

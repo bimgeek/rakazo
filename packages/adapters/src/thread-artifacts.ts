@@ -128,6 +128,15 @@ export async function materializeCurrentTurnFiles(
     markWorkspaceDirty?: () => void;
   },
 ): Promise<MaterializedThreadFile[]> {
+  return materializeThreadFiles(deps, blocks, input, false);
+}
+
+async function materializeThreadFiles(
+  deps: Parameters<typeof materializeCurrentTurnFiles>[0],
+  blocks: MessageBlock[] | undefined,
+  input: Parameters<typeof materializeCurrentTurnFiles>[2],
+  preserveExisting: boolean,
+): Promise<MaterializedThreadFile[]> {
   // "image" attachments (e.g. a photo pasted or uploaded in chat) are backed
   // by a real artifact exactly like "file" ones — the model seeing them
   // inline for vision (loadCurrentTurnImages) doesn't put them on disk, so
@@ -152,22 +161,32 @@ export async function materializeCurrentTurnFiles(
   for (const block of fileBlocks) {
     const row = byId.get(block.artifactId);
     if (!row) throw new Error(`Attached file is unavailable: ${block.name}`);
-    const bytes = await deps.artifacts.get(row.storageKey, input.context);
-    if (bytes.byteLength > (deps.maxUploadSizeBytes ?? ATTACHMENT_MAX_BYTES)) {
-      throw new Error(
-        `Attached file exceeds the ${attachmentSizeLabel(deps.maxUploadSizeBytes ?? ATTACHMENT_MAX_BYTES)} limit: ${row.name}`,
+    const relativePath = `attachments/${row.id}${attachmentExtensionForMimeType(row.mimeType)}`;
+    const workspacePath = resolveBotWorkspacePath(
+      input.computerMode,
+      input.context.botId,
+      relativePath,
+    );
+    const exists = preserveExisting
+      ? await deps.sandbox.readFile(input.computer, workspacePath, input.context).then(
+          () => true,
+          () => false,
+        )
+      : false;
+    if (!exists) {
+      const bytes = await deps.artifacts.get(row.storageKey, input.context);
+      if (bytes.byteLength > (deps.maxUploadSizeBytes ?? ATTACHMENT_MAX_BYTES)) {
+        throw new Error(
+          `Attached file exceeds the ${attachmentSizeLabel(deps.maxUploadSizeBytes ?? ATTACHMENT_MAX_BYTES)} limit: ${row.name}`,
+        );
+      }
+      input.markWorkspaceDirty?.();
+      await deps.sandbox.writeFile(
+        input.computer,
+        { path: workspacePath, content: bytes },
+        input.context,
       );
     }
-    const relativePath = `attachments/${row.id}${attachmentExtensionForMimeType(row.mimeType)}`;
-    input.markWorkspaceDirty?.();
-    await deps.sandbox.writeFile(
-      input.computer,
-      {
-        path: resolveBotWorkspacePath(input.computerMode, input.context.botId, relativePath),
-        content: bytes,
-      },
-      input.context,
-    );
     materialized.push({
       name: row.name,
       mimeType: row.mimeType,
@@ -190,8 +209,16 @@ export async function materializeRecentThreadFiles(
 ): Promise<MaterializedThreadFile[]> {
   const materialized: MaterializedThreadFile[] = [];
   for (const block of recentAttachmentBlocks(history, messages, input)) {
+    if (materialized.length >= ATTACHMENT_MAX_COUNT) break;
     try {
-      materialized.push(...(await materializeCurrentTurnFiles(deps, [block], input)));
+      materialized.push(
+        ...(await materializeThreadFiles(
+          deps,
+          [block],
+          { ...input, markWorkspaceDirty: undefined },
+          true,
+        )),
+      );
     } catch (error) {
       if (input.context.signal.aborted) throw error;
       getLogger().warn("earlier thread attachment was not copied to the computer", {
@@ -221,7 +248,6 @@ function recentAttachmentBlocks(
     if (!attached.length) continue;
     turns += 1;
     for (const block of attached.reverse()) {
-      if (selected.size >= ATTACHMENT_MAX_COUNT) break;
       if (!selected.has(block.artifactId)) selected.set(block.artifactId, block);
     }
   }
