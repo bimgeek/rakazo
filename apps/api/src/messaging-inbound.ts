@@ -42,11 +42,7 @@ export interface MessagingInboundDeps {
    */
   openSignup: boolean;
   signupPolicy: SignupPolicyEnv;
-  /**
-   * Best-effort "…" bubbles shown to a 1:1 sender while their run executes.
-   * Cosmetic only — callers must catch failures; groups never get it.
-   */
-  typing?: (threadId: string) => Promise<void>;
+  acknowledge?: (threadId: string, handle: string) => void;
 }
 
 type IdentityRow = {
@@ -150,14 +146,7 @@ async function handleDirectEvent(
     clientNonce: `messaging:${event.provider}:${event.handle}`,
   });
   if (sent.runId) {
-    // Typing bubbles only make sense once a reply is actually coming. Fire
-    // before the enqueue so they land ahead of a fast reply, and never await:
-    // a stalled vendor typing call must not hold the webhook open. The bubbles
-    // clear on their own after a short display window or when the reply
-    // arrives, so long runs simply outlive them.
-    void deps.typing?.(event.threadId).catch((error) => {
-      getLogger().error("messaging typing indicator error", error);
-    });
+    deps.acknowledge?.(event.threadId, event.handle);
     await deps.jobs.enqueue(runContinueJob(sent.runId)).catch((error) => {
       getLogger().error("messaging inbound run enqueue error", error);
     });

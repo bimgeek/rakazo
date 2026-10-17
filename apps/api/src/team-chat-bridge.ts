@@ -65,6 +65,7 @@ interface TeamChatBridgeDeps {
   providerId: string;
   botId: string;
   judge?: TeamChatEngagementJudge;
+  acknowledge?: (threadId: string, handle: string) => void;
   reconcileIntervalMs?: number;
   ambientDebounceMs?: number;
 }
@@ -300,6 +301,9 @@ export class TeamChatBridge {
         where: { id: externalMessage.id },
         data: { kind: message.kind, status, nextAttemptAt, engagementReason: null, judgedAt: null },
       });
+    }
+    if (message.kind !== "ambient") {
+      this.deps.acknowledge?.(message.conversationId, message.eventId);
     }
     await this.ensureTranscriptMessage(externalMessage, conversation, message.attachments ?? []);
     if (options?.queueAgent === false) {

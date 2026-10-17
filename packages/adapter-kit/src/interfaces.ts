@@ -398,10 +398,11 @@ export interface MessagingSurface {
   /** Resolve (or create) the 1:1 thread for a provider address. */
   openDirectThread(provider: string, address: string, context: AdapterContext): Promise<string>;
   /**
-   * Best-effort "…" typing bubbles for 1:1 chats. Cosmetic: never gates
-   * message delivery, and silently no-ops on platforms without support.
+   * Best-effort receipt for an inbound message (typing bubbles or a
+   * reaction). Cosmetic: never gates delivery, and no-ops on platforms
+   * without a receipt.
    */
-  sendTyping(threadId: string, context: AdapterContext): Promise<void>;
+  acknowledge(threadId: string, handle: string, context: AdapterContext): Promise<void>;
   /**
    * Up to `limit` messages posted in a thread before the `before` handle,
    * oldest first, normalized like inbound events. Absent when no platform can.

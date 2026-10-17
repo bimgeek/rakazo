@@ -42,7 +42,7 @@ function createDeps(
   );
   const notify = vi.fn(async () => undefined);
   const enqueue = vi.fn(async () => undefined);
-  const typing = vi.fn(async (_threadId: string) => undefined);
+  const acknowledge = vi.fn((_threadId: string, _handle: string) => undefined);
   const provision = vi.fn(async (request: { provider: string; address: string }) => ({
     provider: request.provider,
     address: request.address,
@@ -246,7 +246,7 @@ function createDeps(
     provision,
     openSignup: true,
     signupPolicy,
-    typing,
+    acknowledge,
     sendUserMessage,
     notify,
     enqueue,
@@ -258,7 +258,7 @@ function createDeps(
     sendUserMessage: ReturnType<typeof vi.fn>;
     notify: ReturnType<typeof vi.fn>;
     enqueue: ReturnType<typeof vi.fn>;
-    typing: ReturnType<typeof vi.fn>;
+    acknowledge: ReturnType<typeof vi.fn>;
     provision: ReturnType<typeof vi.fn>;
     outboundRows: Array<Record<string, unknown>>;
     members: Array<Record<string, unknown>>;
@@ -576,13 +576,13 @@ describe("createMessagingInboundHandler DM routing", () => {
   });
 });
 
-describe("typing indicators", () => {
-  it("shows typing bubbles in the sender's thread once their DM run is enqueued", async () => {
+describe("inbound receipt", () => {
+  it("acknowledges the DM in the sender's thread once their run is enqueued", async () => {
     const deps = createDeps();
     const handle = createMessagingInboundHandler(deps);
     await handle(dmEvent);
 
-    expect(deps.typing).toHaveBeenCalledWith("sendblue:dm-1");
+    expect(deps.acknowledge).toHaveBeenCalledWith("sendblue:dm-1", "handle-1");
   });
 
   it("stays silent when the message produced no run", async () => {
@@ -590,7 +590,7 @@ describe("typing indicators", () => {
     const handle = createMessagingInboundHandler(deps);
     await handle(dmEvent);
 
-    expect(deps.typing).not.toHaveBeenCalled();
+    expect(deps.acknowledge).not.toHaveBeenCalled();
   });
 
   it("stays silent for owner commands, which get a text confirmation instead", async () => {
@@ -600,39 +600,25 @@ describe("typing indicators", () => {
     const handle = createMessagingInboundHandler(deps);
     await handle({ ...dmEvent, content: "YES" });
 
-    expect(deps.typing).not.toHaveBeenCalled();
+    expect(deps.acknowledge).not.toHaveBeenCalled();
   });
 
-  it("never shows typing in groups", async () => {
+  it("never acknowledges in groups", async () => {
     const deps = createDeps();
     const handle = createMessagingInboundHandler(deps);
     await handle(groupEvent);
 
-    expect(deps.typing).not.toHaveBeenCalled();
+    expect(deps.acknowledge).not.toHaveBeenCalled();
   });
 
-  it("starts typing before enqueueing the run, so the bubbles beat the reply", async () => {
+  it("acknowledges before enqueueing the run, so the receipt beats the reply", async () => {
     const deps = createDeps();
     const handle = createMessagingInboundHandler(deps);
     await handle(dmEvent);
 
-    expect(deps.typing.mock.invocationCallOrder[0]!).toBeLessThan(
+    expect(deps.acknowledge.mock.invocationCallOrder[0]!).toBeLessThan(
       deps.enqueue.mock.invocationCallOrder[0]!,
     );
-  });
-
-  it("still delivers the run when the typing call fails", async () => {
-    const deps = createDeps();
-    deps.typing.mockRejectedValue(new Error("messaging provider down"));
-    const handle = createMessagingInboundHandler(deps);
-    await handle(dmEvent);
-    // The rejection is caught inside the handler; give the fire-and-forget
-    // promise a tick to settle so a bad catch surfaces here, not as an
-    // unhandled rejection after the test.
-    await new Promise((resolve) => setImmediate(resolve));
-
-    expect(deps.enqueue).toHaveBeenCalled();
-    expect(deps.sendUserMessage).toHaveBeenCalled();
   });
 });
 

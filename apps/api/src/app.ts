@@ -139,6 +139,8 @@ export const MOBILE_AUTH_ORIGINS = [
   "http://127.0.0.1:19006",
 ];
 
+const RECEIPT_TIMEOUT_MS = 2000;
+
 export interface AppHandles {
   app: Hono;
   prisma: PrismaClient;
@@ -694,6 +696,18 @@ export async function createApp(
   let teamChatBridgeInstance: TeamChatBridge | undefined;
   const pendingTeamChatInbound = new PendingTeamChatInbound();
   if (messaging) {
+    const acknowledge = (threadId: string, handle: string): void => {
+      const operationId = `messaging.acknowledge:${randomUUID()}`;
+      messaging
+        .acknowledge(threadId, handle, {
+          operationId,
+          traceId: operationId,
+          spaceId: "",
+          userId: "",
+          signal: AbortSignal.timeout(RECEIPT_TIMEOUT_MS),
+        })
+        .catch((error) => getLogger().error("messaging receipt error", error));
+    };
     const inboundDeps = {
       prisma,
       events,
@@ -704,21 +718,7 @@ export async function createApp(
         signupsEnabled: env.signupsEnabled,
         signupAllowlist: env.signupAllowlist,
       },
-      typing: (threadId) => {
-        // Keep conversation addresses out of trace ids — those reach logs
-        // and telemetry, a different trust boundary than the database.
-        const operationId = `messaging.typing:${randomUUID()}`;
-        return messaging.sendTyping(threadId, {
-          operationId,
-          traceId: operationId,
-          spaceId: "",
-          userId: "",
-          // Cosmetic side call: the wait is bounded so a stalled vendor
-          // response never holds our callback chain (the Chat SDK adapter
-          // API cannot cancel the underlying request itself).
-          signal: AbortSignal.timeout(2000),
-        });
-      },
+      acknowledge,
     } satisfies Parameters<typeof createMessagingInboundHandler>[0];
     const inbound = createMessagingInboundHandler(inboundDeps);
     const handleTeamChatInbound = async (
@@ -847,6 +847,7 @@ export async function createApp(
         providerId: "slack",
         botId: env.teamChatBotId,
         judge,
+        acknowledge,
       });
       teamChatBridgeInstance = bridge;
       try {
