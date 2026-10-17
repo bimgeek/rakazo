@@ -312,6 +312,7 @@ export class ChatSdkMessagingSurface implements MessagingSurface {
       content: message.text ?? "",
       mediaUrl: message.attachments.find((attachment) => attachment.url)?.url ?? null,
       ...(attachments.length ? { attachments } : {}),
+      ...(!isDirect && message.isMention ? { mentionsBot: true } : {}),
     };
     const enrichment = platform.enrichTeamRoom?.(message.raw, base) ?? {};
     return { ...base, ...enrichment };
