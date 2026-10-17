@@ -289,8 +289,39 @@ describe("team chat bridge", () => {
     },
   );
 
-  it("includes transcript files from the triggering ambient batch in the run message", async () => {
-    const judgedAt = new Date(1_000);
+  it.each([false, true])("selects only judged batch files (legacy context: %s)", async (legacy) => {
+    const messageIds = Array.from({ length: 20 }, (_, index) => `external-${index + 1}`);
+    const conversation = {
+      spaceId: "space-1",
+      userId: "owner-1",
+      botId: "bot-1",
+      thread: { id: "thread-1" },
+      conversationId: "C-1",
+      automatedSenderPolicies: {
+        "ignored-bot": { name: "Ignored", mode: "ignore" },
+        "action-bot": { name: "Action", mode: "action" },
+      },
+    };
+    const observed = Array.from({ length: 21 }, (_, index) => ({
+      id: `external-${index}`,
+      providerEventId: `Ev-${index}`,
+      senderId: index === 20 ? "action-bot" : "human",
+      senderName: "Ada",
+      senderIsBot: index === 20,
+      content: `Message ${index}`,
+      createdAt: new Date(0),
+      externalConversationId: "conversation-1",
+      externalConversation: conversation,
+    }));
+    observed.unshift({
+      ...observed[0]!,
+      id: "ignored-file",
+      senderId: "ignored-bot",
+      senderIsBot: true,
+    });
+    const updateMany = vi.fn(async (_input: { data?: { batchContext?: string } }) => ({
+      count: 1,
+    }));
     const file = {
       kind: "file" as const,
       artifactId: "document-1",
@@ -307,9 +338,17 @@ describe("team chat bridge", () => {
     }));
     const bridge = new TeamChatBridge({
       prisma: {
+        bot: {
+          findFirst: vi.fn(async () => ({
+            id: "bot-1",
+            teamChatAmbientEnabled: true,
+            teamChatRules: "",
+          })),
+        },
         message: { findUnique: vi.fn(async () => null), findMany },
         externalMessage: {
-          updateMany: vi.fn(async () => ({ count: 1 })),
+          updateMany,
+          findMany: vi.fn(async () => observed),
           findUnique: vi.fn(async () => ({
             status: "queueing",
             engagementReason: "message_teamchat_agent",
@@ -323,14 +362,23 @@ describe("team chat bridge", () => {
       providerId: "slack",
       botId: "bot-1",
     });
-    await (bridge as unknown as { queue(message: unknown): Promise<void> }).queue({
-      id: "external-trigger",
+    const internals = bridge as unknown as {
+      target: { id: string };
+      evaluateAmbient(now: Date): Promise<void>;
+      queue(message: unknown): Promise<void>;
+    };
+    internals.target = { id: "bot-1" };
+    await internals.evaluateAmbient(new Date(60_000));
+    const batchContext = updateMany.mock.calls.find(([input]) => input.data?.batchContext)?.[0].data
+      ?.batchContext;
+    expect(JSON.parse(batchContext ?? "{}").messageIds).toEqual(messageIds);
+    await internals.queue({
+      id: "external-20",
       providerEventId: "Ev-batch",
       senderId: "U-1",
       senderName: "Ada",
       content: "Summarize the report above",
-      batchContext: "Recent messages",
-      judgedAt,
+      batchContext: legacy ? JSON.parse(batchContext ?? "{}").prompt : batchContext,
       externalConversation: {
         spaceId: "space-1",
         userId: "owner-1",
@@ -341,14 +389,14 @@ describe("team chat bridge", () => {
     expect(findMany).toHaveBeenCalledWith({
       where: {
         threadId: "thread-1",
-        externalMessage: { OR: [{ id: "external-trigger" }, { judgedAt }] },
+        externalTranscriptFor: { id: { in: legacy ? ["external-20"] : messageIds } },
       },
       select: { blocks: true },
       orderBy: { seq: "asc" },
     });
     expect(sendUserMessage).toHaveBeenCalledWith(
       expect.objectContaining({
-        blocks: [{ kind: "text", text: "Recent messages" }, file],
+        blocks: [{ kind: "text", text: JSON.parse(batchContext ?? "{}").prompt }, file],
         trigger: "messaging",
         linkMessageToRun: true,
       }),

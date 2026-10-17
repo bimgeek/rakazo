@@ -131,6 +131,28 @@ export function teamChatAmbientPrompt(input: {
     .join("\n\n");
 }
 
+function readBatchContext(
+  value: string | null,
+): { prompt: string; messageIds: string[] } | undefined {
+  if (!value) return undefined;
+  try {
+    const batch: unknown = JSON.parse(value);
+    if (
+      batch !== null &&
+      typeof batch === "object" &&
+      "prompt" in batch &&
+      typeof batch.prompt === "string" &&
+      "messageIds" in batch &&
+      Array.isArray(batch.messageIds) &&
+      batch.messageIds.every((id): id is string => typeof id === "string")
+    )
+      return { prompt: batch.prompt, messageIds: batch.messageIds };
+  } catch {
+    // Previously persisted batches contain only the plain prompt.
+  }
+  return { prompt: value, messageIds: [] };
+}
+
 export class TeamChatBridge {
   private target: TargetBot | undefined;
   private timer: ReturnType<typeof setInterval> | undefined;
@@ -936,17 +958,20 @@ export class TeamChatBridge {
       const promoted = await this.promoteAmbientTrigger(trigger.id, {
         judgedAt: now,
         engagementReason: decision.reason ?? null,
-        batchContext: teamChatAmbientPrompt({
-          provider: this.deps.providerId,
-          channelId: latest.externalConversation.conversationId,
-          channelName: latest.externalConversation.displayName,
-          rules,
-          reason: decision.reason,
-          messages: judgedMessages.map((message) => ({
-            senderId: message.senderId,
-            senderName: message.senderName,
-            content: message.content,
-          })),
+        batchContext: JSON.stringify({
+          messageIds: judgedMessages.map(({ id }) => id),
+          prompt: teamChatAmbientPrompt({
+            provider: this.deps.providerId,
+            channelId: latest.externalConversation.conversationId,
+            channelName: latest.externalConversation.displayName,
+            rules,
+            reason: decision.reason,
+            messages: judgedMessages.map((message) => ({
+              senderId: message.senderId,
+              senderName: message.senderName,
+              content: message.content,
+            })),
+          }),
         }),
       });
       if (promoted)
@@ -1018,7 +1043,6 @@ export class TeamChatBridge {
     senderName: string;
     content: string;
     batchContext: string | null;
-    judgedAt?: Date | null;
     engagementReason?: string | null;
     externalConversation: {
       spaceId: string;
@@ -1117,17 +1141,14 @@ export class TeamChatBridge {
       await abandonForRoutine("queueing");
       return;
     }
+    const batch = readBatchContext(message.batchContext);
     const prompt =
-      message.batchContext ??
-      teamChatPrompt(this.deps.providerId, message.senderName, message.content);
+      batch?.prompt ?? teamChatPrompt(this.deps.providerId, message.senderName, message.content);
     const transcripts = await this.deps.prisma.message.findMany({
       where: {
         threadId: thread.id,
-        externalMessage: {
-          OR: [
-            { id: message.id },
-            ...(message.batchContext && message.judgedAt ? [{ judgedAt: message.judgedAt }] : []),
-          ],
+        externalTranscriptFor: {
+          id: { in: batch?.messageIds.length ? batch.messageIds : [message.id] },
         },
       },
       select: { blocks: true },
