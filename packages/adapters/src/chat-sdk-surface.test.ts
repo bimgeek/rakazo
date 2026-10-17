@@ -138,6 +138,19 @@ describe("ChatSdkMessagingSurface inbound", () => {
     });
   });
 
+  it.each([
+    "# Heading\n\n*literal asterisks* and `backticks`",
+    "# Heading\n\n*literal asterisks* and `backticks` [https://example.test/](https://example.test/)",
+  ])("keeps the adapter's original text when no link target is added: %s", async (text) => {
+    const { surface, events } = createSurface();
+    await surface.handleWebhook(
+      "mock",
+      webhookRequest({ threadId: "mock:Duser:1", id: "m-1", text }),
+    );
+
+    expect(events[0]).toMatchObject({ content: text });
+  });
+
   it("never surfaces the bot's own messages", async () => {
     const { surface, events } = createSurface();
     const response = await surface.handleWebhook(

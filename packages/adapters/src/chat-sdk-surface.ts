@@ -296,16 +296,21 @@ export class ChatSdkMessagingSurface implements MessagingSurface {
  * `example.com/projects/…` reaches the model without its target.
  */
 function plainTextWithLinks(message: Message): string {
+  let addedTarget = false;
   const ast = walkAst(structuredClone(message.formatted), (node) => {
     if (!isLinkNode(node)) return node;
     const label = toPlainText({ type: "root", children: node.children }).trim();
     const bare = node.url.replace(/^(?:https?:\/\/|mailto:)/, "");
-    if (!label) return text(node.url);
+    if (!label) {
+      addedTarget = true;
+      return text(node.url);
+    }
     if (label === node.url || label === bare || label === bare.replace(/\/$/, ""))
       return text(label);
+    addedTarget = true;
     return text(`${label} (${node.url})`);
   });
-  return toPlainText(ast);
+  return addedTarget ? toPlainText(ast) : (message.text ?? "");
 }
 
 export function providerOfThreadId(threadId: string): string {
