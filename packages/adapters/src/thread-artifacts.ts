@@ -11,6 +11,7 @@ import {
   ARTIFACT_DESCRIPTION_MAX_LENGTH,
   ARTIFACT_NAME_MAX_LENGTH,
   ATTACHMENT_MAX_BYTES,
+  ATTACHMENT_MAX_COUNT,
   attachmentSizeLabel,
 } from "@rakazo/contracts";
 import {
@@ -21,6 +22,7 @@ import {
 } from "@rakazo/core";
 import type { PrismaClient } from "@rakazo/db";
 import { withResolvedArtifactVersion } from "@rakazo/db";
+import { getLogger } from "@rakazo/logging";
 import { resolveBotWorkspacePath } from "./computer-support.js";
 
 export type MaterializedThreadFile = {
@@ -180,13 +182,70 @@ export async function materializeCurrentTurnFiles(
   return materialized;
 }
 
+/**
+ * Attachments from the newest earlier user turns the model still sees, so a
+ * picture it can describe is also a file it can upload or forward. Team chat
+ * depends on this: its files arrive on transcript rows, never on the run's own
+ * message. A file that can no longer be read is left out instead of failing
+ * the run.
+ */
+export async function materializeRecentThreadFiles(
+  deps: Parameters<typeof materializeCurrentTurnFiles>[0],
+  history: ReadonlyArray<{ id?: string; role: string }>,
+  messages: ReadonlyArray<{ id: string; blocks: MessageBlock[] }>,
+  input: Parameters<typeof materializeCurrentTurnFiles>[2] & {
+    skipMessageId?: string | null;
+    maxTurns: number;
+  },
+): Promise<MaterializedThreadFile[]> {
+  const blocksByMessageId = new Map(messages.map((message) => [message.id, message.blocks]));
+  const selected = new Map<string, Extract<MessageBlock, { kind: "file" | "image" }>>();
+  let turns = 0;
+  for (let index = history.length - 1; index >= 0 && turns < input.maxTurns; index -= 1) {
+    const entry = history[index];
+    if (!entry?.id || entry.role !== "user" || entry.id === input.skipMessageId) continue;
+    const attached = (blocksByMessageId.get(entry.id) ?? []).filter(
+      (block): block is Extract<MessageBlock, { kind: "file" | "image" }> =>
+        block.kind === "file" || block.kind === "image",
+    );
+    if (!attached.length) continue;
+    turns += 1;
+    for (const block of attached.reverse()) {
+      if (selected.size >= ATTACHMENT_MAX_COUNT) break;
+      if (!selected.has(block.artifactId)) selected.set(block.artifactId, block);
+    }
+  }
+
+  const materialized: MaterializedThreadFile[] = [];
+  for (const block of selected.values()) {
+    try {
+      materialized.push(...(await materializeCurrentTurnFiles(deps, [block], input)));
+    } catch (error) {
+      if (input.context.signal.aborted) throw error;
+      getLogger().warn("earlier thread attachment was not copied to the computer", {
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return materialized;
+}
+
+function fileLine(file: MaterializedThreadFile): string {
+  return `- ${JSON.stringify(file.name)} (${file.mimeType}, ${file.size} bytes): ${JSON.stringify(file.path)}`;
+}
+
 export function currentTurnFilesInstruction(files: readonly MaterializedThreadFile[]): string {
   if (!files.length) return "";
   return [
     "Current-turn attached files are available on your computer. Inspect them before answering:",
-    ...files.map(
-      (file) =>
-        `- ${JSON.stringify(file.name)} (${file.mimeType}, ${file.size} bytes): ${JSON.stringify(file.path)}`,
-    ),
+    ...files.map(fileLine),
+  ].join("\n");
+}
+
+export function recentThreadFilesInstruction(files: readonly MaterializedThreadFile[]): string {
+  if (!files.length) return "";
+  return [
+    "Files attached earlier in this conversation are also on your computer:",
+    ...files.map(fileLine),
   ].join("\n");
 }
