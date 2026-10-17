@@ -299,9 +299,10 @@ function plainTextWithLinks(message: Message): string {
   const ast = walkAst(structuredClone(message.formatted), (node) => {
     if (!isLinkNode(node)) return node;
     const label = toPlainText({ type: "root", children: node.children }).trim();
-    const bare = node.url.replace(/^(?:https?:\/\/|mailto:)/, "").replace(/\/$/, "");
+    const bare = node.url.replace(/^(?:https?:\/\/|mailto:)/, "");
     if (!label) return text(node.url);
-    if (label === node.url || label === bare) return text(label);
+    if (label === node.url || label === bare || label === bare.replace(/\/$/, ""))
+      return text(label);
     return text(`${label} (${node.url})`);
   });
   return toPlainText(ast);
