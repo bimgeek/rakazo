@@ -1276,9 +1276,13 @@ export class TeamChatBridge {
       select: { blocks: true },
       orderBy: { seq: "asc" },
     });
-    const fileBlocks = transcripts.flatMap(({ blocks }) =>
-      (blocks as MessageBlock[]).filter((block) => block.kind === "file" || block.kind === "image"),
-    );
+    const fileBlocks = transcripts
+      .flatMap(({ blocks }) =>
+        (blocks as MessageBlock[]).filter(
+          (block) => block.kind === "file" || block.kind === "image",
+        ),
+      )
+      .slice(-ATTACHMENT_MAX_COUNT);
     const sent = await this.deps.events.sendUserMessage({
       spaceId: message.externalConversation.spaceId,
       threadId: thread.id,

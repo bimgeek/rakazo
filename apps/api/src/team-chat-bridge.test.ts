@@ -572,7 +572,16 @@ describe("team chat bridge", () => {
       mimeType: "application/pdf",
       size: 3,
     };
-    const findMany = vi.fn(async () => [{ blocks: [file] }]);
+    const files = Array.from({ length: 6 }, (_, index) => ({
+      ...file,
+      artifactId: `document-${index + 1}`,
+      name: `report-${index + 1}.pdf`,
+    }));
+    const findMany = vi.fn(async () => [
+      { blocks: files.slice(0, 2) },
+      { blocks: files.slice(2, 4) },
+      { blocks: files.slice(4) },
+    ]);
     const sendUserMessage = vi.fn(async () => ({
       messageId: "prompt-1",
       runId: "run-1",
@@ -639,7 +648,10 @@ describe("team chat bridge", () => {
     });
     expect(sendUserMessage).toHaveBeenCalledWith(
       expect.objectContaining({
-        blocks: [{ kind: "text", text: JSON.parse(batchContext ?? "{}").prompt }, file],
+        blocks: [
+          { kind: "text", text: JSON.parse(batchContext ?? "{}").prompt },
+          ...files.slice(-4),
+        ],
         trigger: "messaging",
         linkMessageToRun: true,
       }),
