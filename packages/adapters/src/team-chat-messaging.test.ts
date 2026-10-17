@@ -164,6 +164,7 @@ describe("createMessagingTeamChatHistory", () => {
   });
 
   it("reads the reply thread and places each message in the asking room as ambient context", async () => {
+    const timeout = vi.spyOn(AbortSignal, "timeout");
     const fetchThreadHistory = vi.fn(async () => [
       baseEvent({ handle: "100.1", content: "look at this", threadId: "slack:C1:100.1" }),
       baseEvent({ handle: "100.2", content: " " }),
@@ -190,6 +191,8 @@ describe("createMessagingTeamChatHistory", () => {
       { before: "100.9", limit: 50 },
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
+    expect(timeout).toHaveBeenCalledWith(1_000);
+    timeout.mockRestore();
     expect(history).toEqual([
       expect.objectContaining({
         eventId: "100.1",

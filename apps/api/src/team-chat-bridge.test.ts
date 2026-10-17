@@ -238,7 +238,7 @@ describe("team chat bridge", () => {
         },
       );
       const findFirst = vi.fn(async (_query: unknown) =>
-        input.knownThread ? { id: "root" } : null,
+        input.knownThread || rows.size > 0 ? { id: "root" } : null,
       );
       const prisma = {
         externalConversation: {
@@ -356,6 +356,70 @@ describe("team chat bridge", () => {
       expect(sendUserMessage.mock.calls[2]?.[0]).toMatchObject({
         blocks: [{ kind: "text", text: "@Chief is this a LOD issue?" }],
       });
+    });
+
+    it("waits for an unfinished backfill before recording later mentions or ambient messages", async () => {
+      const { bridge, upsert, storeAttachment, sendUserMessage, fetchThreadHistory } = setup({
+        knownThread: false,
+        history: [earlier("100.1", ["a.png"]), earlier("100.2")],
+      });
+      let release!: () => void;
+      const blocked = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      storeAttachment.mockImplementationOnce(async () => {
+        await blocked;
+        return { id: "artifact-a.png", name: "a.png", mimeType: "image/png", size: 3 };
+      });
+      const first = bridge.receive(mention, { queueAgent: false });
+      await vi.waitFor(() => expect(storeAttachment).toHaveBeenCalledOnce());
+      const second = bridge.receive({ ...mention, eventId: "100.10" }, { queueAgent: false });
+      const ambient = bridge.receive(
+        { ...mention, kind: "ambient", eventId: "100.11" },
+        { queueAgent: false },
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(upsert).toHaveBeenCalledOnce();
+      expect(sendUserMessage).not.toHaveBeenCalled();
+      release();
+      await Promise.all([first, second, ambient]);
+      expect(upsert.mock.calls.slice(0, 2).map(([call]) => call.create.providerEventId)).toEqual([
+        "100.1",
+        "100.2",
+      ]);
+      expect(fetchThreadHistory).toHaveBeenCalledOnce();
+      // Retried deliveries reuse both the external row and its visible transcript.
+      await bridge.receive(mention, { queueAgent: false });
+      expect(sendUserMessage).toHaveBeenCalledTimes(5);
+      expect(fetchThreadHistory).toHaveBeenCalledOnce();
+      expect(
+        (bridge as unknown as { threadBackfills: Map<string, Promise<void>> }).threadBackfills.size,
+      ).toBe(0);
+    });
+
+    it("skips remaining history files after the shared download deadline", async () => {
+      vi.useFakeTimers();
+      try {
+        const { bridge, storeAttachment, sendUserMessage } = setup({
+          knownThread: false,
+          history: [earlier("100.1", ["a.png"]), earlier("100.2", ["b.png"])],
+        });
+        storeAttachment.mockImplementationOnce(async () => {
+          vi.setSystemTime(Date.now() + 2_000);
+          throw new Error("Attachment download timed out");
+        });
+        await bridge.receive(mention, { queueAgent: false });
+        expect(storeAttachment).toHaveBeenCalledOnce();
+        expect(storeAttachment.mock.calls[0]?.[0]).toMatchObject({
+          downloadDeadline: expect.any(Number),
+        });
+        expect(sendUserMessage.mock.calls[1]?.[0]).toMatchObject({
+          blocks: [{ kind: "text", text: "message 100.2\n[file: b.png (unavailable)]" }],
+        });
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it("answers a mention that a concurrent backfill recorded as history", async () => {

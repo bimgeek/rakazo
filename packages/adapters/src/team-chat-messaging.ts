@@ -66,7 +66,7 @@ export function resolveMessagingThreadId(
 }
 
 export const TEAM_CHAT_THREAD_HISTORY_LIMIT = 50;
-const THREAD_HISTORY_TIMEOUT_MS = 10_000;
+const THREAD_HISTORY_TIMEOUT_MS = 1_000;
 
 export function createMessagingTeamChatHistory(
   messaging: MessagingSurface,

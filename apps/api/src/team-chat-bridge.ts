@@ -60,6 +60,7 @@ interface TeamChatBridgeDeps {
     botId: string;
     attachment: MessagingInboundAttachment;
     clientNonce: string;
+    downloadDeadline?: number;
   }) => Promise<{ id: string; name: string; mimeType: string; size: number }>;
   providerId: string;
   botId: string;
@@ -155,6 +156,7 @@ function readBatchContext(
 }
 
 export class TeamChatBridge {
+  private readonly threadBackfills = new Map<string, Promise<void>>();
   private target: TargetBot | undefined;
   private timer: ReturnType<typeof setInterval> | undefined;
   private reconciling: Promise<void> | undefined;
@@ -237,7 +239,7 @@ export class TeamChatBridge {
     message: TeamChatInboundMessage,
     options?: { queueAgent?: boolean },
   ): Promise<TeamChatInboundTarget | DeferredTeamChatInboundTarget> {
-    if (message.kind !== "ambient") await this.backfillThreadHistory(message);
+    await this.backfillThreadHistory(message);
     const conversation = await this.upsertConversation(message);
     const now = new Date();
     const deferredUntil = new Date(now.getTime() + DEFERRED_RESERVATION_MS);
@@ -312,14 +314,33 @@ export class TeamChatBridge {
   }
 
   private async backfillThreadHistory(message: TeamChatInboundMessage): Promise<void> {
+    if (!message.replyThreadId) return;
+    const key = JSON.stringify([
+      this.deps.providerId,
+      message.workspaceId,
+      message.conversationKey,
+      message.replyThreadId,
+    ]);
+    const pending = this.threadBackfills.get(key);
+    if (pending) return pending;
     const fetchThreadHistory = this.deps.fetchThreadHistory;
-    if (!fetchThreadHistory || (await this.knowsReplyThread(message))) return;
+    if (!fetchThreadHistory || message.kind === "ambient") return;
+    const backfill = (async () => {
+      if (await this.knowsReplyThread(message)) return;
+      const downloadDeadline = Date.now() + 2_000;
+      try {
+        await this.receiveHistory(await fetchThreadHistory(message), downloadDeadline);
+      } catch (error) {
+        getLogger().warn("team chat thread history was not loaded", {
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      }
+    })();
+    this.threadBackfills.set(key, backfill);
     try {
-      await this.receiveHistory(await fetchThreadHistory(message));
-    } catch (error) {
-      getLogger().warn("team chat thread history was not loaded", {
-        reason: error instanceof Error ? error.message : String(error),
-      });
+      await backfill;
+    } finally {
+      this.threadBackfills.delete(key);
     }
   }
 
@@ -340,7 +361,10 @@ export class TeamChatBridge {
     return known !== null;
   }
 
-  private async receiveHistory(messages: TeamChatInboundMessage[]): Promise<void> {
+  private async receiveHistory(
+    messages: TeamChatInboundMessage[],
+    downloadDeadline: number,
+  ): Promise<void> {
     const first = messages[0];
     if (!first) return;
     const conversation = await this.upsertConversation(first);
@@ -371,8 +395,9 @@ export class TeamChatBridge {
       await this.ensureTranscriptMessage(
         externalMessage,
         conversation,
-        message.attachments,
+        message.attachments ?? [],
         fileLimits[index],
+        downloadDeadline,
       );
     }
   }
@@ -591,12 +616,19 @@ export class TeamChatBridge {
     },
     attachments?: MessagingInboundAttachment[],
     fileLimit = ATTACHMENT_MAX_COUNT,
+    downloadDeadline?: number,
   ): Promise<void> {
     if (message.threadMessageId) return;
     if (!conversation.thread) throw new Error("Team chat conversation has no Rakazo thread");
     // Fetchers cannot survive a restart; reuse any completed per-file uploads.
     const stored = attachments
-      ? await this.storeAttachments(message.id, conversation, attachments, fileLimit)
+      ? await this.storeAttachments(
+          message.id,
+          conversation,
+          attachments,
+          fileLimit,
+          downloadDeadline,
+        )
       : {
           artifacts: await this.deps.prisma.artifact.findMany({
             where: {
@@ -644,12 +676,17 @@ export class TeamChatBridge {
     conversation: { spaceId: string; botId: string; userId: string },
     attachments: MessagingInboundAttachment[],
     fileLimit: number,
+    downloadDeadline?: number,
   ) {
     const artifacts: Array<{ id: string; name: string; mimeType: string; size: number }> = [];
     const unavailable: string[] = [];
     const storeAttachment = this.deps.storeAttachment;
     for (const [index, attachment] of attachments.entries()) {
-      if (!storeAttachment || index >= fileLimit) {
+      if (
+        !storeAttachment ||
+        index >= fileLimit ||
+        (downloadDeadline !== undefined && Date.now() >= downloadDeadline)
+      ) {
         unavailable.push(`[file: ${attachment.name} (unavailable)]`);
         continue;
       }
@@ -661,6 +698,7 @@ export class TeamChatBridge {
             botId: conversation.botId,
             attachment,
             clientNonce: `teamchat-attachment:${externalMessageId}:${index}`,
+            ...(downloadDeadline !== undefined ? { downloadDeadline } : {}),
           }),
         );
       } catch (error) {
