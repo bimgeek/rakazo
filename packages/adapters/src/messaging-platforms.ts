@@ -119,14 +119,18 @@ export function messagingPlatformsFromEnv(
   }
 
   if (env.slackBotToken && env.slackSigningSecret) {
+    const slack = createSlackAdapter({
+      botToken: env.slackBotToken,
+      signingSecret: env.slackSigningSecret,
+    });
     platforms.push({
       provider: "slack",
       capabilities: { direct: true, groups: true, typing: false },
-      adapter: createSlackAdapter({
-        botToken: env.slackBotToken,
-        signingSecret: env.slackSigningSecret,
-      }),
-      enrichTeamRoom: enrichSlackTeamRoom,
+      adapter: slack,
+      // The Chat SDK hands us the inner Slack event, not the envelope, so a
+      // plain `message` event has no authorizations to name our bot user. Fall
+      // back to the id the adapter resolved from auth.test at startup.
+      enrichTeamRoom: (raw, base) => enrichSlackTeamRoom(raw, base, slack.botUserId),
     });
   }
 
@@ -234,6 +238,7 @@ export function parseSendblueStatus(payload: unknown): MessagingOutboundStatus |
 export function enrichSlackTeamRoom(
   raw: unknown,
   base: MessagingInboundMessage,
+  fallbackBotUserId?: string,
 ): Partial<MessagingInboundMessage> {
   const root = asRecord(raw);
   if (!root) return {};
@@ -256,7 +261,11 @@ export function enrichSlackTeamRoom(
   else enrichment.replyThreadId = null;
   if (!base.isDirect) {
     const text = stringField(event, "text") ?? base.content;
-    const botUserId = slackAuthorizedBotUserId(root);
+    // Slack sends both app_mention and message.* for one channel mention and
+    // the SDK keeps whichever arrives first, so the plain event must detect
+    // the mention too: use the envelope's authorizations when present,
+    // otherwise the adapter's own bot user id.
+    const botUserId = slackAuthorizedBotUserId(root) ?? fallbackBotUserId;
     // app_mention is Slack's bot-directed event. A bare <@U…> mention of
     // someone else must stay ambient so listen policy still applies.
     enrichment.kind =

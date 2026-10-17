@@ -319,6 +319,21 @@ describe("enrichSlackTeamRoom", () => {
     expect(enrichment.kind).toBe("ambient");
   });
 
+  it("falls back to the adapter bot user id when the event carries no authorizations", () => {
+    // Slack delivers app_mention and message.channels for one mention; the Chat
+    // SDK keeps whichever arrives first and hands over the inner event only.
+    const raw = {
+      type: "message",
+      channel: "C1",
+      text: "<@U_BOT> respond back please?",
+      user: "U_OTHER",
+      team: "T1",
+    };
+    expect(enrichSlackTeamRoom(raw, base, "U_BOT").kind).toBe("mention");
+    expect(enrichSlackTeamRoom(raw, base, "U_ELSE").kind).toBe("ambient");
+    expect(enrichSlackTeamRoom(raw, base).kind).toBe("ambient");
+  });
+
   it("marks message events that mention the authorized bot as mention", () => {
     const enrichment = enrichSlackTeamRoom(
       {
