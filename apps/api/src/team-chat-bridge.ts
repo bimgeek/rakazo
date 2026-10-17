@@ -60,6 +60,8 @@ interface TeamChatBridgeDeps {
   events: Pick<ThreadEvents, "sendUserMessage">;
   jobs: Pick<JobPublisher, "enqueue">;
   send: (request: TeamChatSendRequest) => Promise<TeamChatSendResult>;
+  /** Earlier messages of the message's reply thread, oldest first, mapped into its conversation. */
+  fetchThreadHistory?: (message: TeamChatInboundMessage) => Promise<TeamChatInboundMessage[]>;
   /** Stores an inbound file as the conversation owner's artifact (validates type and size). */
   storeAttachment?: (input: {
     spaceId: string;
@@ -222,42 +224,8 @@ export class TeamChatBridge {
     message: TeamChatInboundMessage,
     options?: { queueAgent?: boolean },
   ): Promise<TeamChatInboundTarget | DeferredTeamChatInboundTarget> {
-    const target = this.target;
-    if (!target) throw new Error("Team chat bridge is not started");
-    const conversation = await this.deps.prisma.externalConversation.upsert({
-      where: {
-        provider_workspaceId_externalKey: {
-          provider: this.deps.providerId,
-          workspaceId: message.workspaceId,
-          externalKey: message.conversationKey,
-        },
-      },
-      create: {
-        provider: this.deps.providerId,
-        workspaceId: message.workspaceId,
-        externalKey: message.conversationKey,
-        conversationId: message.conversationId,
-        displayName: message.conversationName,
-        participantNames: message.participantNames ?? [],
-        spaceId: target.spaceId,
-        botId: target.id,
-        userId: target.userId,
-        thread: { create: { spaceId: target.spaceId, userId: target.userId } },
-      },
-      update: {
-        conversationId: message.conversationId,
-        ...(message.conversationName ? { displayName: message.conversationName } : {}),
-        ...(message.participantNames?.length ? { participantNames: message.participantNames } : {}),
-      },
-      include: { thread: { select: { id: true } } },
-    });
-    if (
-      conversation.botId !== target.id ||
-      conversation.spaceId !== target.spaceId ||
-      !conversation.thread
-    ) {
-      throw new Error("Team chat conversation belongs to a different Rakazo target");
-    }
+    if (message.kind !== "ambient") await this.backfillThreadHistory(message);
+    const conversation = await this.upsertConversation(message);
     const now = new Date();
     const deferredUntil = new Date(now.getTime() + DEFERRED_RESERVATION_MS);
     const externalMessage = await this.deps.prisma.externalMessage.upsert({
@@ -319,6 +287,129 @@ export class TeamChatBridge {
       botId: conversation.botId,
       threadId: conversation.thread.id,
     };
+  }
+
+  /**
+   * A bot mentioned in a reply thread whose opening message it never
+   * received (it joined later, or was not in the channel) reads the earlier
+   * messages first. Best effort: the mention is still answered without them.
+   */
+  private async backfillThreadHistory(message: TeamChatInboundMessage): Promise<void> {
+    const fetchThreadHistory = this.deps.fetchThreadHistory;
+    if (!fetchThreadHistory || !(await this.missesThreadStart(message))) return;
+    try {
+      await this.receiveHistory(await fetchThreadHistory(message));
+    } catch (error) {
+      getLogger().warn("team chat thread history was not loaded", {
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private async missesThreadStart(message: TeamChatInboundMessage): Promise<boolean> {
+    if (!message.replyThreadId || message.replyThreadId === message.eventId) return false;
+    const seen = await this.deps.prisma.externalMessage.findFirst({
+      where: {
+        providerEventId: message.replyThreadId,
+        externalConversation: {
+          provider: this.deps.providerId,
+          workspaceId: message.workspaceId,
+          externalKey: message.conversationKey,
+        },
+      },
+      select: { id: true },
+    });
+    return !seen;
+  }
+
+  /**
+   * Earlier thread messages become transcript-only rows: they never engage
+   * the bot themselves. Only the newest files are downloaded; older ones
+   * leave a marker.
+   */
+  private async receiveHistory(messages: TeamChatInboundMessage[]): Promise<void> {
+    const first = messages[0];
+    if (!first) return;
+    const conversation = await this.upsertConversation(first);
+    let fileBudget = ATTACHMENT_MAX_COUNT;
+    const fileLimits = messages
+      .toReversed()
+      .map((message) => {
+        const limit = Math.min(message.attachments?.length ?? 0, fileBudget);
+        fileBudget -= limit;
+        return limit;
+      })
+      .toReversed();
+    for (const [index, message] of messages.entries()) {
+      const externalMessage = await this.deps.prisma.externalMessage.upsert({
+        where: {
+          externalConversationId_providerEventId: {
+            externalConversationId: conversation.id,
+            providerEventId: message.eventId,
+          },
+        },
+        create: {
+          externalConversationId: conversation.id,
+          providerEventId: message.eventId,
+          kind: message.kind,
+          senderId: message.senderId,
+          senderName: message.senderName,
+          senderIsBot: message.senderIsBot ?? false,
+          content: message.content,
+          replyThreadId: message.replyThreadId,
+          status: "ignored",
+          engagementReason: "thread_history",
+          judgedAt: new Date(),
+        },
+        update: {},
+      });
+      await this.ensureTranscriptMessage(
+        externalMessage,
+        conversation,
+        message.attachments,
+        fileLimits[index],
+      );
+    }
+  }
+
+  private async upsertConversation(message: TeamChatInboundMessage) {
+    const target = this.target;
+    if (!target) throw new Error("Team chat bridge is not started");
+    const conversation = await this.deps.prisma.externalConversation.upsert({
+      where: {
+        provider_workspaceId_externalKey: {
+          provider: this.deps.providerId,
+          workspaceId: message.workspaceId,
+          externalKey: message.conversationKey,
+        },
+      },
+      create: {
+        provider: this.deps.providerId,
+        workspaceId: message.workspaceId,
+        externalKey: message.conversationKey,
+        conversationId: message.conversationId,
+        displayName: message.conversationName,
+        participantNames: message.participantNames ?? [],
+        spaceId: target.spaceId,
+        botId: target.id,
+        userId: target.userId,
+        thread: { create: { spaceId: target.spaceId, userId: target.userId } },
+      },
+      update: {
+        conversationId: message.conversationId,
+        ...(message.conversationName ? { displayName: message.conversationName } : {}),
+        ...(message.participantNames?.length ? { participantNames: message.participantNames } : {}),
+      },
+      include: { thread: { select: { id: true } } },
+    });
+    if (
+      conversation.botId !== target.id ||
+      conversation.spaceId !== target.spaceId ||
+      !conversation.thread
+    ) {
+      throw new Error("Team chat conversation belongs to a different Rakazo target");
+    }
+    return { ...conversation, thread: conversation.thread };
   }
 
   /** Keep a deferred lease alive while routine routing is still in progress. */
@@ -494,10 +585,16 @@ export class TeamChatBridge {
       thread: { id: string } | null;
     },
     attachments: MessagingInboundAttachment[] = [],
+    fileLimit = ATTACHMENT_MAX_COUNT,
   ): Promise<void> {
     if (message.threadMessageId) return;
     if (!conversation.thread) throw new Error("Team chat conversation has no Rakazo thread");
-    const stored = await this.storeAttachments(message.providerEventId, conversation, attachments);
+    const stored = await this.storeAttachments(
+      message.providerEventId,
+      conversation,
+      attachments,
+      fileLimit,
+    );
     const text = [message.content.trim(), ...stored.unavailable].filter(Boolean).join("\n");
     const visible = await this.deps.events.sendUserMessage({
       spaceId: conversation.spaceId,
@@ -528,12 +625,13 @@ export class TeamChatBridge {
     providerEventId: string,
     conversation: { spaceId: string; botId: string; userId: string },
     attachments: MessagingInboundAttachment[],
+    fileLimit: number,
   ) {
     const artifacts: Array<{ id: string; name: string; mimeType: string; size: number }> = [];
     const unavailable: string[] = [];
     const storeAttachment = this.deps.storeAttachment;
     for (const [index, attachment] of attachments.entries()) {
-      if (!storeAttachment || index >= ATTACHMENT_MAX_COUNT) {
+      if (!storeAttachment || index >= fileLimit) {
         unavailable.push(`[file: ${attachment.name} (unavailable)]`);
         continue;
       }

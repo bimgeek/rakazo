@@ -214,6 +214,141 @@ describe("team chat bridge", () => {
     );
   });
 
+  describe("thread history", () => {
+    function setup(input: { seenRoot: boolean; history?: TeamChatInboundMessage[] | Error }) {
+      const upsert = vi.fn(async ({ create }: { create: Record<string, unknown> }) => ({
+        id: `external-${String(create.providerEventId)}`,
+        ...create,
+        threadMessageId: null,
+      }));
+      const prisma = {
+        externalConversation: {
+          upsert: vi.fn(async () => ({
+            id: "conversation-1",
+            provider: "slack",
+            spaceId: "space-1",
+            botId: "bot-1",
+            userId: "owner-1",
+            thread: { id: "thread-1" },
+          })),
+        },
+        externalMessage: {
+          findFirst: vi.fn(async () => (input.seenRoot ? { id: "root" } : null)),
+          upsert,
+          update: vi.fn(async () => ({})),
+          updateMany: vi.fn(async () => ({ count: 1 })),
+        },
+      } as unknown as PrismaClient;
+      const sendUserMessage = vi.fn(async () => ({
+        messageId: "transcript",
+        runId: null,
+        seq: 1,
+        taskId: null,
+      }));
+      const fetchThreadHistory = vi.fn(async () => {
+        if (input.history instanceof Error) throw input.history;
+        return input.history ?? [];
+      });
+      const storeAttachment = vi.fn(async (request: { attachment: { name: string } }) => ({
+        id: `artifact-${request.attachment.name}`,
+        name: request.attachment.name,
+        mimeType: "image/png",
+        size: 3,
+      }));
+      const bridge = new TeamChatBridge({
+        prisma,
+        events: { sendUserMessage },
+        jobs: { enqueue: vi.fn() },
+        send: vi.fn(),
+        fetchThreadHistory,
+        storeAttachment,
+        providerId: "slack",
+        botId: "bot-1",
+      });
+      (
+        bridge as unknown as {
+          target: { id: string; spaceId: string; userId: string; name: string };
+        }
+      ).target = { id: "bot-1", spaceId: "space-1", userId: "owner-1", name: "Chief" };
+      return { bridge, upsert, sendUserMessage, fetchThreadHistory, storeAttachment };
+    }
+    const mention: TeamChatInboundMessage = {
+      eventId: "100.9",
+      workspaceId: "T-1",
+      kind: "mention",
+      conversationKey: "C-1",
+      conversationId: "slack:C-1:100.1",
+      replyThreadId: "100.1",
+      senderId: "U-2",
+      senderName: "Alex",
+      content: "@Chief is this a LOD issue?",
+    };
+    const earlier = (eventId: string, files: string[] = []): TeamChatInboundMessage => ({
+      ...mention,
+      eventId,
+      kind: "ambient",
+      senderName: "David",
+      content: `message ${eventId}`,
+      attachments: files.map((name) => ({
+        name,
+        mimeType: "image/png",
+        fetch: async () => new Uint8Array([1]),
+      })),
+    });
+
+    it("records the earlier thread as transcript-only history before the mention", async () => {
+      const { bridge, upsert, sendUserMessage, storeAttachment } = setup({
+        seenRoot: false,
+        history: [
+          earlier("100.1", ["a.png", "b.png"]),
+          earlier("100.2", ["c.png", "d.png", "e.png"]),
+        ],
+      });
+
+      await bridge.receive(mention, { queueAgent: false });
+
+      expect(
+        upsert.mock.calls.map(([call]) => [call.create.providerEventId, call.create.status]),
+      ).toEqual([
+        ["100.1", "ignored"],
+        ["100.2", "ignored"],
+        ["100.9", "deferred"],
+      ]);
+      // Only the newest files are downloaded; the one over budget leaves a marker.
+      expect(storeAttachment.mock.calls.map(([call]) => call.attachment.name)).toEqual([
+        "a.png",
+        "c.png",
+        "d.png",
+        "e.png",
+      ]);
+      expect(sendUserMessage.mock.calls[0]?.[0]).toMatchObject({
+        blocks: [
+          { kind: "text", text: "message 100.1\n[file: b.png (unavailable)]" },
+          { kind: "image", artifactId: "artifact-a.png" },
+        ],
+      });
+      expect(sendUserMessage.mock.calls[2]?.[0]).toMatchObject({
+        blocks: [{ kind: "text", text: "@Chief is this a LOD issue?" }],
+      });
+    });
+
+    it("skips threads whose opening message the bot already has", async () => {
+      const { bridge, fetchThreadHistory } = setup({ seenRoot: true });
+      await bridge.receive(mention, { queueAgent: false });
+      await bridge.receive(
+        { ...mention, kind: "ambient", eventId: "100.10" },
+        { queueAgent: false },
+      );
+      expect(fetchThreadHistory).not.toHaveBeenCalled();
+    });
+
+    it("still records the mention when history cannot be read", async () => {
+      const { bridge, upsert } = setup({ seenRoot: false, history: new Error("rate limited") });
+      await bridge.receive(mention, { queueAgent: false });
+      expect(upsert).toHaveBeenCalledOnce();
+    });
+  });
+
   it("recovers expired deferred reservations before normal reconciliation", async () => {
     const updateMany = vi.fn(async () => ({ count: 0 }));
     const findMany = vi.fn(async ({ where }: { where: { status?: string } }) =>

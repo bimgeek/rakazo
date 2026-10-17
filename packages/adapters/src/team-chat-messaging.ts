@@ -64,6 +64,52 @@ export function resolveMessagingThreadId(
   return `${conversationId}:${replyThreadId}`;
 }
 
+/** Earlier thread messages a bot reads when first mentioned mid-thread. */
+export const TEAM_CHAT_THREAD_HISTORY_LIMIT = 50;
+const THREAD_HISTORY_TIMEOUT_MS = 10_000;
+
+/**
+ * Thread history reader over the MessagingSurface, or undefined when no
+ * platform can read history. Fetched messages carry no webhook envelope, so
+ * each is placed in the asking message's room and kept as ambient context.
+ */
+export function createMessagingTeamChatHistory(
+  messaging: MessagingSurface,
+): ((message: TeamChatInboundMessage) => Promise<TeamChatInboundMessage[]>) | undefined {
+  const fetchThreadHistory = messaging.fetchThreadHistory?.bind(messaging);
+  if (!fetchThreadHistory) return undefined;
+  return async (message) => {
+    if (!message.replyThreadId) return [];
+    const operationId = `team-chat-history:${randomUUID()}`;
+    const history = await fetchThreadHistory(
+      resolveMessagingThreadId(message.conversationId, message.replyThreadId),
+      { before: message.eventId, limit: TEAM_CHAT_THREAD_HISTORY_LIMIT },
+      {
+        operationId,
+        traceId: operationId,
+        spaceId: "",
+        userId: "",
+        signal: AbortSignal.timeout(THREAD_HISTORY_TIMEOUT_MS),
+      },
+    );
+    return history.flatMap((event) => {
+      const mapped = toTeamChatInbound(event);
+      if (!mapped) return [];
+      return [
+        {
+          ...mapped,
+          kind: "ambient" as const,
+          workspaceId: message.workspaceId,
+          conversationKey: message.conversationKey,
+          conversationId: message.conversationId,
+          conversationName: message.conversationName,
+          replyThreadId: message.replyThreadId,
+        },
+      ];
+    });
+  };
+}
+
 /** Outbound sender that posts through the existing MessagingSurface. */
 export function createMessagingTeamChatSender(
   messaging: MessagingSurface,
