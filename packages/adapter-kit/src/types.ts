@@ -753,6 +753,8 @@ export interface MessagingInboundMessage {
   mediaUrl: string | null;
   /** Files the platform only serves to the bot's credentials (Slack url_private, …). */
   attachments?: MessagingInboundAttachment[];
+  /** The platform reports that this group message @-mentions the bot. */
+  mentionsBot?: boolean;
   /** Team-room workspace/team id when the platform reports one (Slack team_id, …). */
   workspaceId?: string;
   /** Stable conversation key within the workspace (channel id, DM key, …). */
