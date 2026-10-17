@@ -39,6 +39,8 @@ function createPlatform(
           id: string;
           text: string;
           isMe?: boolean;
+          /** Files; `authenticated` ones carry a fetchData like Slack url_private. */
+          files?: Array<{ name: string; url: string; authenticated?: boolean }>;
         };
         // Fire-and-forget: matches Chat SDK adapters that return 200 before
         // processMessage settles, relying on waitUntil for background work.
@@ -55,6 +57,14 @@ function createPlatform(
               isBot: false,
               isMe: payload.isMe ?? false,
             },
+            attachments: (payload.files ?? []).map((file) => ({
+              type: "image" as const,
+              name: file.name,
+              url: file.url,
+              mimeType: "image/png",
+              size: 3,
+              ...(file.authenticated ? { fetchData: async () => Buffer.from([1, 2, 3]) } : {}),
+            })),
           }),
           options,
         );
@@ -136,6 +146,30 @@ describe("ChatSdkMessagingSurface inbound", () => {
       content:
         "see example.test/projects/… (https://example.test/projects/abc) and https://example.test/ or https://example.test/x",
     });
+  });
+
+  it("hands authenticated files over as fetchable attachments instead of a url", async () => {
+    const { surface, events } = createSurface();
+    await surface.handleWebhook(
+      "mock",
+      webhookRequest({
+        threadId: "mock:Duser:1",
+        id: "m-1",
+        text: "",
+        files: [
+          { name: "screen.png", url: "https://files.example.test/private", authenticated: true },
+          { name: "public.png", url: "https://cdn.example.test/public.png" },
+        ],
+      }),
+    );
+
+    const event = events[0];
+    if (event?.type !== "message") throw new Error("expected a message");
+    expect(event.mediaUrl).toBe("https://cdn.example.test/public.png");
+    expect(event.attachments).toEqual([
+      { name: "screen.png", mimeType: "image/png", size: 3, fetch: expect.any(Function) },
+    ]);
+    await expect(event.attachments?.[0]?.fetch()).resolves.toEqual(new Uint8Array([1, 2, 3]));
   });
 
   it("never surfaces the bot's own messages", async () => {

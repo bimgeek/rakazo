@@ -127,6 +127,93 @@ describe("team chat bridge", () => {
     );
   });
 
+  it("stores inbound files on the transcript message and marks the ones it could not keep", async () => {
+    const prisma = {
+      externalConversation: {
+        upsert: vi.fn(async () => ({
+          id: "conversation-1",
+          provider: "slack",
+          spaceId: "space-1",
+          botId: "bot-1",
+          userId: "owner-1",
+          thread: { id: "thread-1" },
+        })),
+      },
+      externalMessage: {
+        upsert: vi.fn(async ({ create }: { create: Record<string, unknown> }) => ({
+          id: "external-1",
+          ...create,
+          threadMessageId: null,
+        })),
+        update: vi.fn(async () => ({})),
+        updateMany: vi.fn(async () => ({ count: 1 })),
+      },
+    } as unknown as PrismaClient;
+    const sendUserMessage = vi.fn(async () => ({
+      messageId: "transcript-1",
+      runId: null,
+      seq: 1,
+      taskId: null,
+    }));
+    const storeAttachment = vi.fn(
+      async (input: { attachment: { name: string }; clientNonce: string }) => {
+        if (input.attachment.name === "huge.mov") throw new Error("too large");
+        return { id: "artifact-1", name: input.attachment.name, mimeType: "image/png", size: 3 };
+      },
+    );
+    const bridge = new TeamChatBridge({
+      prisma,
+      events: { sendUserMessage },
+      jobs: { enqueue: vi.fn() },
+      send: vi.fn(),
+      storeAttachment,
+      providerId: "slack",
+      botId: "bot-1",
+    });
+    (
+      bridge as unknown as {
+        target: { id: string; spaceId: string; userId: string; name: string };
+      }
+    ).target = { id: "bot-1", spaceId: "space-1", userId: "owner-1", name: "Chief" };
+    const fetch = vi.fn(async () => new Uint8Array([1, 2, 3]));
+
+    await bridge.receive(
+      {
+        eventId: "Ev-files",
+        workspaceId: "T-1",
+        kind: "ambient",
+        conversationKey: "C-1",
+        conversationId: "slack:C-1:",
+        senderId: "U-1",
+        senderName: "Ada",
+        content: "",
+        attachments: [
+          { name: "screen.png", mimeType: "image/png", size: 3, fetch },
+          { name: "huge.mov", mimeType: "video/quicktime", size: 99, fetch },
+        ],
+      },
+      { queueAgent: false },
+    );
+
+    expect(storeAttachment).toHaveBeenCalledWith(
+      expect.objectContaining({
+        spaceId: "space-1",
+        userId: "owner-1",
+        botId: "bot-1",
+        clientNonce: "teamchat-attachment:slack:Ev-files:0",
+      }),
+    );
+    expect(sendUserMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        blocks: [
+          { kind: "text", text: "[file: huge.mov (unavailable)]" },
+          { kind: "image", artifactId: "artifact-1", mimeType: "image/png", name: "screen.png" },
+        ],
+        createRun: false,
+      }),
+    );
+  });
+
   it("recovers expired deferred reservations before normal reconciliation", async () => {
     const updateMany = vi.fn(async () => ({ count: 0 }));
     const findMany = vi.fn(async ({ where }: { where: { status?: string } }) =>

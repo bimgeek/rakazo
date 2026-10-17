@@ -1,12 +1,21 @@
 import type {
   JobPublisher,
+  MessagingInboundAttachment,
   TeamChatInboundMessage,
   TeamChatSendRequest,
   TeamChatSendResult,
 } from "@rakazo/adapter-kit";
 import { runContinueJob } from "@rakazo/adapter-kit";
-import { AutomatedSenderPoliciesSchema, type MessageBlock } from "@rakazo/contracts";
-import { BOT_MESSAGE_MAX_HOPS } from "@rakazo/core";
+import {
+  ATTACHMENT_MAX_COUNT,
+  AutomatedSenderPoliciesSchema,
+  type MessageBlock,
+} from "@rakazo/contracts";
+import {
+  BOT_MESSAGE_MAX_HOPS,
+  messageBlockForArtifact,
+  promptTextForAttachments,
+} from "@rakazo/core";
 import type { PrismaClient, ThreadEvents } from "@rakazo/db";
 import { getLogger } from "@rakazo/logging";
 import type { TeamChatEngagementJudge } from "./team-chat-judge.js";
@@ -51,6 +60,14 @@ interface TeamChatBridgeDeps {
   events: Pick<ThreadEvents, "sendUserMessage">;
   jobs: Pick<JobPublisher, "enqueue">;
   send: (request: TeamChatSendRequest) => Promise<TeamChatSendResult>;
+  /** Stores an inbound file as the conversation owner's artifact (validates type and size). */
+  storeAttachment?: (input: {
+    spaceId: string;
+    userId: string;
+    botId: string;
+    attachment: MessagingInboundAttachment;
+    clientNonce: string;
+  }) => Promise<{ id: string; name: string; mimeType: string; size: number }>;
   providerId: string;
   botId: string;
   judge?: TeamChatEngagementJudge;
@@ -269,7 +286,7 @@ export class TeamChatBridge {
       },
       update: {},
     });
-    await this.ensureTranscriptMessage(externalMessage, conversation);
+    await this.ensureTranscriptMessage(externalMessage, conversation, message.attachments);
     if (options?.queueAgent === false) {
       const deferred =
         (externalMessage.status === "deferred" &&
@@ -476,16 +493,22 @@ export class TeamChatBridge {
       userId: string;
       thread: { id: string } | null;
     },
+    attachments: MessagingInboundAttachment[] = [],
   ): Promise<void> {
     if (message.threadMessageId) return;
     if (!conversation.thread) throw new Error("Team chat conversation has no Rakazo thread");
+    const stored = await this.storeAttachments(message.providerEventId, conversation, attachments);
+    const text = [message.content.trim(), ...stored.unavailable].filter(Boolean).join("\n");
     const visible = await this.deps.events.sendUserMessage({
       spaceId: conversation.spaceId,
       threadId: conversation.thread.id,
       botId: conversation.botId,
       userId: conversation.userId,
-      blocks: [{ kind: "text", text: message.content }],
-      prompt: message.content,
+      blocks: [
+        ...(text ? [{ kind: "text" as const, text }] : []),
+        ...stored.artifacts.map((artifact) => messageBlockForArtifact(artifact)),
+      ],
+      prompt: promptTextForAttachments(text, stored.artifacts),
       trigger: "messaging",
       clientNonce: `teamchat-transcript:${this.deps.providerId}:${message.providerEventId}`,
       createRun: false,
@@ -494,6 +517,44 @@ export class TeamChatBridge {
       where: { id: message.id },
       data: { threadMessageId: visible.messageId },
     });
+  }
+
+  /**
+   * Inbound files become artifacts on the transcript message, so the model
+   * sees the pictures in recent history. Only a live webhook carries the
+   * fetchers; a file that cannot be stored leaves a marker instead.
+   */
+  private async storeAttachments(
+    providerEventId: string,
+    conversation: { spaceId: string; botId: string; userId: string },
+    attachments: MessagingInboundAttachment[],
+  ) {
+    const artifacts: Array<{ id: string; name: string; mimeType: string; size: number }> = [];
+    const unavailable: string[] = [];
+    const storeAttachment = this.deps.storeAttachment;
+    for (const [index, attachment] of attachments.entries()) {
+      if (!storeAttachment || index >= ATTACHMENT_MAX_COUNT) {
+        unavailable.push(`[file: ${attachment.name} (unavailable)]`);
+        continue;
+      }
+      try {
+        artifacts.push(
+          await storeAttachment({
+            spaceId: conversation.spaceId,
+            userId: conversation.userId,
+            botId: conversation.botId,
+            attachment,
+            clientNonce: `teamchat-attachment:${this.deps.providerId}:${providerEventId}:${index}`,
+          }),
+        );
+      } catch (error) {
+        getLogger().warn("team chat attachment was not stored", {
+          reason: error instanceof Error ? error.message : String(error),
+        });
+        unavailable.push(`[file: ${attachment.name} (unavailable)]`);
+      }
+    }
+    return { artifacts, unavailable };
   }
 
   /**

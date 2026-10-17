@@ -13,7 +13,7 @@ import type {
 export function toTeamChatInbound(event: MessagingInboundMessage): TeamChatInboundMessage | null {
   const mediaLine = event.mediaUrl?.trim() ? `\n${event.mediaUrl.trim()}` : "";
   const content = `${event.content}${mediaLine}`.trim();
-  if (!content) return null;
+  if (!content && !event.attachments?.length) return null;
 
   const kind: TeamChatMessageKind = event.isDirect
     ? "direct"
@@ -36,6 +36,7 @@ export function toTeamChatInbound(event: MessagingInboundMessage): TeamChatInbou
     senderName: event.fromLabel?.trim() || event.from,
     senderIsBot: event.senderIsBot,
     content,
+    ...(event.attachments?.length ? { attachments: event.attachments } : {}),
   };
 }
 
