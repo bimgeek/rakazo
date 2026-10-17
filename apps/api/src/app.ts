@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { ORPCError, onError } from "@orpc/server";
 import { RPCHandler } from "@orpc/server/fetch";
 import type {
@@ -111,6 +110,7 @@ import {
   teamChatSenderCanWakeMessageRoutines,
   wakeMessageRoutines,
 } from "./messaging-inbound.js";
+import { createMessagingReceipts } from "./messaging-receipts.js";
 import { mountMessagingWebhookRoutes } from "./messaging-webhook.js";
 import { mountApiRequestBodyLimits } from "./request-body-limit.js";
 import { createRouter } from "./router.js";
@@ -138,8 +138,6 @@ export const MOBILE_AUTH_ORIGINS = [
   "http://localhost:19006",
   "http://127.0.0.1:19006",
 ];
-
-const RECEIPT_TIMEOUT_MS = 2000;
 
 export interface AppHandles {
   app: Hono;
@@ -695,19 +693,8 @@ export async function createApp(
   /** Constructed even before start() succeeds so stop() can cancel in-flight startup. */
   let teamChatBridgeInstance: TeamChatBridge | undefined;
   const pendingTeamChatInbound = new PendingTeamChatInbound();
+  const receipts = messaging ? createMessagingReceipts(messaging) : undefined;
   if (messaging) {
-    const acknowledge = (threadId: string, handle: string): void => {
-      const operationId = `messaging.acknowledge:${randomUUID()}`;
-      messaging
-        .acknowledge(threadId, handle, {
-          operationId,
-          traceId: operationId,
-          spaceId: "",
-          userId: "",
-          signal: AbortSignal.timeout(RECEIPT_TIMEOUT_MS),
-        })
-        .catch((error) => getLogger().error("messaging receipt error", error));
-    };
     const inboundDeps = {
       prisma,
       events,
@@ -718,7 +705,7 @@ export async function createApp(
         signupsEnabled: env.signupsEnabled,
         signupAllowlist: env.signupAllowlist,
       },
-      acknowledge,
+      acknowledge: receipts?.acknowledge,
     } satisfies Parameters<typeof createMessagingInboundHandler>[0];
     const inbound = createMessagingInboundHandler(inboundDeps);
     const handleTeamChatInbound = async (
@@ -847,7 +834,7 @@ export async function createApp(
         providerId: "slack",
         botId: env.teamChatBotId,
         judge,
-        acknowledge,
+        acknowledge: receipts?.acknowledge,
       });
       teamChatBridgeInstance = bridge;
       try {
@@ -999,6 +986,7 @@ export async function createApp(
       messagingStopped = true;
       clearMessagingRetryDelay?.();
       clearTeamChatRetryDelay?.();
+      receipts?.stop();
       pendingTeamChatInbound.reject(new Error("Team chat bridge stopped before startup"));
       // Cancel in-flight start() before awaiting the retry task so stop() cannot
       // sit on DB/reconcile work that bridge.start() is still running.

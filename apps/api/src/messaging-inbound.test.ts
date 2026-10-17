@@ -42,7 +42,12 @@ function createDeps(
   );
   const notify = vi.fn(async () => undefined);
   const enqueue = vi.fn(async () => undefined);
-  const acknowledge = vi.fn((_threadId: string, _handle: string) => undefined);
+  const acknowledge = vi.fn(
+    (_threadId: string, _handle: string, _answered: () => Promise<boolean>) => undefined,
+  );
+  const runs = new Map<string, { messagingMirroredAt: Date | null }>([
+    ["run-1", { messagingMirroredAt: null }],
+  ]);
   const provision = vi.fn(async (request: { provider: string; address: string }) => ({
     provider: request.provider,
     address: request.address,
@@ -118,6 +123,9 @@ function createDeps(
     },
     messagingLinkCode,
     bot: { findUnique: vi.fn(async () => ({ name: "Chief" })) },
+    run: {
+      findUnique: vi.fn(async ({ where }: { where: { id: string } }) => runs.get(where.id) ?? null),
+    },
     routine: { findMany: vi.fn(async () => overrides.routines ?? []) },
     thread: { findFirst: vi.fn(async () => ({ id: "thread-1" })) },
     messagingChannel: {
@@ -247,6 +255,7 @@ function createDeps(
     openSignup: true,
     signupPolicy,
     acknowledge,
+    runs,
     sendUserMessage,
     notify,
     enqueue,
@@ -258,7 +267,8 @@ function createDeps(
     sendUserMessage: ReturnType<typeof vi.fn>;
     notify: ReturnType<typeof vi.fn>;
     enqueue: ReturnType<typeof vi.fn>;
-    acknowledge: ReturnType<typeof vi.fn>;
+    acknowledge: typeof acknowledge;
+    runs: typeof runs;
     provision: ReturnType<typeof vi.fn>;
     outboundRows: Array<Record<string, unknown>>;
     members: Array<Record<string, unknown>>;
@@ -582,7 +592,20 @@ describe("inbound receipt", () => {
     const handle = createMessagingInboundHandler(deps);
     await handle(dmEvent);
 
-    expect(deps.acknowledge).toHaveBeenCalledWith("sendblue:dm-1", "handle-1");
+    expect(deps.acknowledge.mock.calls).toEqual([
+      ["sendblue:dm-1", "handle-1", expect.any(Function)],
+    ]);
+  });
+
+  it("reports the DM answered once its run's reply is mirrored out", async () => {
+    const deps = createDeps();
+    const handle = createMessagingInboundHandler(deps);
+    await handle(dmEvent);
+    const answered = deps.acknowledge.mock.calls[0]![2];
+
+    await expect(answered()).resolves.toBe(false);
+    deps.runs.get("run-1")!.messagingMirroredAt = new Date("2026-01-01T00:00:00Z");
+    await expect(answered()).resolves.toBe(true);
   });
 
   it("stays silent when the message produced no run", async () => {

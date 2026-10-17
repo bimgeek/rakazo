@@ -42,7 +42,7 @@ export interface MessagingInboundDeps {
    */
   openSignup: boolean;
   signupPolicy: SignupPolicyEnv;
-  acknowledge?: (threadId: string, handle: string) => void;
+  acknowledge?: (threadId: string, handle: string, answered: () => Promise<boolean>) => void;
 }
 
 type IdentityRow = {
@@ -146,7 +146,14 @@ async function handleDirectEvent(
     clientNonce: `messaging:${event.provider}:${event.handle}`,
   });
   if (sent.runId) {
-    deps.acknowledge?.(event.threadId, event.handle);
+    const runId = sent.runId;
+    deps.acknowledge?.(event.threadId, event.handle, async () => {
+      const run = await deps.prisma.run.findUnique({
+        where: { id: runId },
+        select: { messagingMirroredAt: true },
+      });
+      return Boolean(run?.messagingMirroredAt);
+    });
     await deps.jobs.enqueue(runContinueJob(sent.runId)).catch((error) => {
       getLogger().error("messaging inbound run enqueue error", error);
     });

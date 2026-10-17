@@ -2779,7 +2779,10 @@ describe("team chat bridge", () => {
 });
 
 describe("team chat bridge receipt", () => {
-  function receiptBridge(acknowledge: (threadId: string, handle: string) => void) {
+  type Acknowledge = (threadId: string, handle: string, answered: () => Promise<boolean>) => void;
+
+  function receiptBridge(acknowledge: Acknowledge) {
+    const rows = new Map<string, Record<string, unknown>>();
     const sendUserMessage = vi.fn(async () => ({
       messageId: "transcript-1",
       runId: null,
@@ -2798,11 +2801,19 @@ describe("team chat bridge receipt", () => {
         })),
       },
       externalMessage: {
-        upsert: vi.fn(async ({ create }: { create: Record<string, unknown> }) => ({
-          id: `external-${String(create.providerEventId)}`,
-          ...create,
-          threadMessageId: null,
-        })),
+        upsert: vi.fn(async ({ create }: { create: Record<string, unknown> }) => {
+          const row = {
+            id: `external-${String(create.providerEventId)}`,
+            ...create,
+            threadMessageId: null,
+            deliveredAt: null,
+          };
+          rows.set(row.id, row);
+          return row;
+        }),
+        findUnique: vi.fn(
+          async ({ where }: { where: { id: string } }) => rows.get(where.id) ?? null,
+        ),
         update: vi.fn(async () => ({})),
         updateMany: vi.fn(async () => ({ count: 1 })),
         findMany: vi.fn(async () => []),
@@ -2823,7 +2834,7 @@ describe("team chat bridge receipt", () => {
         target: { id: string; spaceId: string; userId: string; name: string };
       }
     ).target = { id: "bot-1", spaceId: "space-1", userId: "owner-1", name: "Chief" };
-    return { bridge, sendUserMessage };
+    return { bridge, sendUserMessage, rows };
   }
 
   function inbound(
@@ -2844,7 +2855,7 @@ describe("team chat bridge receipt", () => {
   }
 
   it("acknowledges mentions and direct messages before mirroring them", async () => {
-    const acknowledge = vi.fn((_threadId: string, _handle: string) => undefined);
+    const acknowledge = vi.fn<Acknowledge>();
     const { bridge, sendUserMessage } = receiptBridge(acknowledge);
 
     await bridge.receive(inbound("1700000000.000100", "mention", "slack:C1:1700000000.000100"));
@@ -2853,8 +2864,8 @@ describe("team chat bridge receipt", () => {
     });
 
     expect(acknowledge.mock.calls).toEqual([
-      ["slack:C1:1700000000.000100", "1700000000.000100"],
-      ["slack:D1:", "1700000000.000200"],
+      ["slack:C1:1700000000.000100", "1700000000.000100", expect.any(Function)],
+      ["slack:D1:", "1700000000.000200", expect.any(Function)],
     ]);
     expect(acknowledge.mock.invocationCallOrder[0]!).toBeLessThan(
       sendUserMessage.mock.invocationCallOrder[0]!,
@@ -2862,12 +2873,26 @@ describe("team chat bridge receipt", () => {
   });
 
   it("does not acknowledge ambient messages", async () => {
-    const acknowledge = vi.fn((_threadId: string, _handle: string) => undefined);
+    const acknowledge = vi.fn<Acknowledge>();
     const { bridge } = receiptBridge(acknowledge);
 
     await bridge.receive(inbound("1700000000.000300", "ambient", "slack:C1:1700000000.000300"));
     await bridge.receive(inbound("1700000000.000400", "mention", "slack:C1:1700000000.000400"));
 
-    expect(acknowledge.mock.calls).toEqual([["slack:C1:1700000000.000400", "1700000000.000400"]]);
+    expect(acknowledge.mock.calls).toEqual([
+      ["slack:C1:1700000000.000400", "1700000000.000400", expect.any(Function)],
+    ]);
+  });
+
+  it("reports the message answered once its reply is delivered", async () => {
+    const acknowledge = vi.fn<Acknowledge>();
+    const { bridge, rows } = receiptBridge(acknowledge);
+
+    await bridge.receive(inbound("1700000000.000500", "mention", "slack:C1:1700000000.000500"));
+    const answered = acknowledge.mock.calls[0]![2];
+
+    await expect(answered()).resolves.toBe(false);
+    rows.get("external-1700000000.000500")!.deliveredAt = new Date("2026-01-01T00:00:00Z");
+    await expect(answered()).resolves.toBe(true);
   });
 });

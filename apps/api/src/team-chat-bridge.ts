@@ -65,7 +65,7 @@ interface TeamChatBridgeDeps {
   providerId: string;
   botId: string;
   judge?: TeamChatEngagementJudge;
-  acknowledge?: (threadId: string, handle: string) => void;
+  acknowledge?: (threadId: string, handle: string, answered: () => Promise<boolean>) => void;
   reconcileIntervalMs?: number;
   ambientDebounceMs?: number;
 }
@@ -303,7 +303,14 @@ export class TeamChatBridge {
       });
     }
     if (message.kind !== "ambient") {
-      this.deps.acknowledge?.(message.conversationId, message.eventId);
+      const externalMessageId = externalMessage.id;
+      this.deps.acknowledge?.(message.conversationId, message.eventId, async () => {
+        const row = await this.deps.prisma.externalMessage.findUnique({
+          where: { id: externalMessageId },
+          select: { deliveredAt: true },
+        });
+        return Boolean(row?.deliveredAt);
+      });
     }
     await this.ensureTranscriptMessage(externalMessage, conversation, message.attachments ?? []);
     if (options?.queueAgent === false) {
