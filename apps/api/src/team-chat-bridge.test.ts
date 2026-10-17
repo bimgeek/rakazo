@@ -182,7 +182,14 @@ describe("team chat bridge", () => {
             },
           ),
           findMany: vi.fn(async ({ where }: { where: Record<string, unknown> }) => {
-            if (!record || record.status !== where.status) return [];
+            if (!record) return [];
+            if (where.threadMessageId === null) {
+              const excluded = (where.id as { notIn: string[] }).notIn;
+              return record.threadMessageId === null && !excluded.includes(String(record.id))
+                ? [{ ...record }]
+                : [];
+            }
+            if (record.status !== where.status) return [];
             if (where.threadMessageId && record.threadMessageId === null) return [];
             return [{ ...record }];
           }),
@@ -2224,82 +2231,96 @@ describe("team chat bridge", () => {
     expect(records[0]).toMatchObject({ status: "delivered" });
   });
 
-  it("repairs previously observed messages that do not have transcript rows", async () => {
-    const conversation = {
-      id: "conversation-legacy",
-      provider: "slack",
-      workspaceId: "T-1",
-      conversationId: "C-1",
-      spaceId: "space-1",
-      botId: "bot-1",
-      userId: "owner-1",
-      thread: { id: "thread-legacy" },
-    };
-    const record = {
-      id: "external-legacy",
-      providerEventId: "Ev-legacy",
-      senderName: "Pat",
-      content: "This ordinary message was already observed.",
-      threadMessageId: null as string | null,
-      status: "ignored",
-      externalConversation: conversation,
-    };
-    const sendUserMessage = vi.fn(async () => ({
-      messageId: "message-visible",
-      seq: 1,
-      taskId: null,
-      runId: null,
-    }));
-    const prisma = {
-      artifact: { findMany: vi.fn(async () => []) },
-      bot: {
-        findFirst: vi.fn(async () => ({
-          id: "bot-1",
-          spaceId: "space-1",
-          userId: "owner-1",
-          name: "Arthur",
-          modelProvider: null,
-          modelId: null,
-        })),
-      },
-      externalMessage: {
-        findMany: vi.fn(async ({ where }: { where: Record<string, unknown> }) => {
-          if (where.threadMessageId === null && record.threadMessageId === null) {
-            return [{ ...record, externalConversation: conversation }];
-          }
-          return [];
+  it.each(["startup", "write", "link"] as const)(
+    "repairs missing transcript messages after %s",
+    async (failure) => {
+      const conversation = {
+        id: "conversation-legacy",
+        provider: "slack",
+        workspaceId: "T-1",
+        conversationId: "C-1",
+        spaceId: "space-1",
+        botId: "bot-1",
+        userId: "owner-1",
+        thread: { id: "thread-legacy" },
+      };
+      const record = {
+        id: "external-legacy",
+        providerEventId: "Ev-legacy",
+        senderName: "Pat",
+        content: "This ordinary message was already observed.",
+        threadMessageId: null as string | null,
+        status: "ignored",
+        externalConversation: conversation,
+      };
+      const sendUserMessage = vi.fn(async () => ({
+        messageId: "message-visible",
+        seq: 1,
+        taskId: null,
+        runId: null,
+      }));
+      const prisma = {
+        artifact: { findMany: vi.fn(async () => []) },
+        bot: {
+          findFirst: vi.fn(async () => ({
+            id: "bot-1",
+            spaceId: "space-1",
+            userId: "owner-1",
+            name: "Arthur",
+            modelProvider: null,
+            modelId: null,
+          })),
+        },
+        externalMessage: {
+          findMany: vi.fn(async ({ where }: { where: Record<string, unknown> }) => {
+            if (where.threadMessageId === null && record.threadMessageId === null) {
+              return [{ ...record, externalConversation: conversation }];
+            }
+            return [];
+          }),
+          update: vi.fn(async ({ data }: { data: { threadMessageId?: string } }) => {
+            if (data.threadMessageId) record.threadMessageId = data.threadMessageId;
+            return record;
+          }),
+          updateMany: vi.fn(async () => ({ count: 0 })),
+        },
+        run: { findMany: vi.fn(async () => []) },
+      } as unknown as PrismaClient;
+
+      const bridge = new TeamChatBridge({
+        prisma,
+        events: { sendUserMessage },
+        jobs: { enqueue: vi.fn() },
+        send: vi.fn(),
+        providerId: "slack",
+        botId: "bot-1",
+        reconcileIntervalMs: 60_000,
+      });
+
+      if (failure === "startup") {
+        await bridge.start();
+        await bridge.stop();
+      } else {
+        const internals = bridge as unknown as { target: { id: string } };
+        internals.target = { id: "bot-1" };
+        if (failure === "write") sendUserMessage.mockRejectedValueOnce(new Error("write failed"));
+        else
+          vi.mocked(prisma.externalMessage.update).mockRejectedValueOnce(new Error("link failed"));
+        await expect(bridge.reconcileOnce()).rejects.toThrow(`${failure} failed`);
+        expect(record.threadMessageId).toBeNull();
+        await bridge.reconcileOnce();
+      }
+
+      expect(sendUserMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          threadId: "thread-legacy",
+          blocks: [{ kind: "text", text: "This ordinary message was already observed." }],
+          createRun: false,
         }),
-        update: vi.fn(async ({ data }: { data: { threadMessageId?: string } }) => {
-          if (data.threadMessageId) record.threadMessageId = data.threadMessageId;
-          return record;
-        }),
-        updateMany: vi.fn(async () => ({ count: 0 })),
-      },
-      run: { findMany: vi.fn(async () => []) },
-    } as unknown as PrismaClient;
-
-    const bridge = new TeamChatBridge({
-      prisma,
-      events: { sendUserMessage },
-      jobs: { enqueue: vi.fn() },
-      send: vi.fn(),
-      providerId: "slack",
-      botId: "bot-1",
-      reconcileIntervalMs: 60_000,
-    });
-
-    await bridge.start();
-    await bridge.stop();
-
-    expect(sendUserMessage).toHaveBeenCalledWith(
-      expect.objectContaining({
-        threadId: "thread-legacy",
-        blocks: [{ kind: "text", text: "This ordinary message was already observed." }],
-        createRun: false,
-      }),
-    );
-    expect(record.threadMessageId).toBe("message-visible");
-  });
+      );
+      expect(record.threadMessageId).toBe("message-visible");
+    },
+  );
   it("does not reopen deliveries finalized as unconfirmed", async () => {
     const update = vi.fn();
     const updateMany = vi.fn(async () => ({ count: 0 }));

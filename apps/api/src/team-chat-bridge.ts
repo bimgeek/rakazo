@@ -161,6 +161,7 @@ export class TeamChatBridge {
   private startGeneration = 0;
   /** Same-process wakes still delivering; do not treat their expired leases as orphans. */
   private readonly inFlightRoutineWakes = new Set<string>();
+  private readonly mirroring = new Map<string, Promise<void>>();
 
   constructor(private readonly deps: TeamChatBridgeDeps) {}
 
@@ -448,6 +449,7 @@ export class TeamChatBridge {
       const messages = await this.deps.prisma.externalMessage.findMany({
         where: {
           threadMessageId: null,
+          id: { notIn: [...this.mirroring.keys()] },
           externalConversation: {
             provider: this.deps.providerId,
             botId: target.id,
@@ -510,50 +512,56 @@ export class TeamChatBridge {
     attachments?: MessagingInboundAttachment[],
   ): Promise<void> {
     if (message.threadMessageId) return;
-    if (!conversation.thread) throw new Error("Team chat conversation has no Rakazo thread");
-    // Fetchers cannot survive a restart; reuse any completed per-file uploads.
-    const stored = attachments
-      ? await this.storeAttachments(message.id, conversation, attachments)
-      : {
-          artifacts: await this.deps.prisma.artifact.findMany({
-            where: {
-              spaceId: conversation.spaceId,
-              userId: conversation.userId,
-              botId: conversation.botId,
-              groupId: null,
-              clientNonce: {
-                in: Array.from(
-                  { length: ATTACHMENT_MAX_COUNT },
-                  (_, index) => `teamchat-attachment:${message.id}:${index}`,
-                ),
+    const pending = this.mirroring.get(message.id);
+    if (pending) return pending;
+    const mirroring = (async () => {
+      if (!conversation.thread) throw new Error("Team chat conversation has no Rakazo thread");
+      // Fetchers cannot survive a restart; reuse any completed per-file uploads.
+      const stored = attachments
+        ? await this.storeAttachments(message.id, conversation, attachments)
+        : {
+            artifacts: await this.deps.prisma.artifact.findMany({
+              where: {
+                spaceId: conversation.spaceId,
+                userId: conversation.userId,
+                botId: conversation.botId,
+                groupId: null,
+                clientNonce: {
+                  in: Array.from(
+                    { length: ATTACHMENT_MAX_COUNT },
+                    (_, index) => `teamchat-attachment:${message.id}:${index}`,
+                  ),
+                },
               },
-            },
-            select: { id: true, name: true, mimeType: true, size: true },
-            orderBy: { clientNonce: "asc" },
-          }),
-          unavailable: [],
-        };
-    const text =
-      [message.content.trim(), ...stored.unavailable].filter(Boolean).join("\n") ||
-      (stored.artifacts.length ? "" : "[file (unavailable)]");
-    const visible = await this.deps.events.sendUserMessage({
-      spaceId: conversation.spaceId,
-      threadId: conversation.thread.id,
-      botId: conversation.botId,
-      userId: conversation.userId,
-      blocks: [
-        ...(text ? [{ kind: "text" as const, text }] : []),
-        ...stored.artifacts.map((artifact) => messageBlockForArtifact(artifact)),
-      ],
-      prompt: promptTextForAttachments(text, stored.artifacts),
-      trigger: "messaging",
-      clientNonce: `teamchat-transcript:${this.deps.providerId}:${message.providerEventId}`,
-      createRun: false,
-    });
-    await this.deps.prisma.externalMessage.update({
-      where: { id: message.id },
-      data: { threadMessageId: visible.messageId },
-    });
+              select: { id: true, name: true, mimeType: true, size: true },
+              orderBy: { clientNonce: "asc" },
+            }),
+            unavailable: [],
+          };
+      const text =
+        [message.content.trim(), ...stored.unavailable].filter(Boolean).join("\n") ||
+        (stored.artifacts.length ? "" : "[file (unavailable)]");
+      const visible = await this.deps.events.sendUserMessage({
+        spaceId: conversation.spaceId,
+        threadId: conversation.thread.id,
+        botId: conversation.botId,
+        userId: conversation.userId,
+        blocks: [
+          ...(text ? [{ kind: "text" as const, text }] : []),
+          ...stored.artifacts.map((artifact) => messageBlockForArtifact(artifact)),
+        ],
+        prompt: promptTextForAttachments(text, stored.artifacts),
+        trigger: "messaging",
+        clientNonce: `teamchat-transcript:${this.deps.providerId}:${message.providerEventId}`,
+        createRun: false,
+      });
+      await this.deps.prisma.externalMessage.update({
+        where: { id: message.id },
+        data: { threadMessageId: visible.messageId },
+      });
+    })().finally(() => this.mirroring.delete(message.id));
+    this.mirroring.set(message.id, mirroring);
+    return mirroring;
   }
 
   private async storeAttachments(
@@ -709,6 +717,7 @@ export class TeamChatBridge {
     const target = this.target;
     if (!target) return;
     const now = new Date();
+    await this.mirrorMissingMessages();
     await this.recoverExpiredDeferredMessages(target, now);
     await this.deps.prisma.externalMessage.updateMany({
       where: {
