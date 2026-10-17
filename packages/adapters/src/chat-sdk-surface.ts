@@ -285,7 +285,16 @@ export class ChatSdkMessagingSurface implements MessagingSurface {
       fromLabel: fromLabel === message.author.userId ? null : fromLabel,
       channelName: isDirect ? null : (platform.channelName?.(message.raw) ?? null),
       participants: isDirect ? [] : (platform.participants?.(message.raw) ?? []),
-      content: plainTextWithLinks(message),
+      content: [
+        plainTextWithLinks(message),
+        ...(attachments.length
+          ? message.attachments
+              .filter((file) => !file.fetchData && file.url)
+              .map((file) => file.url)
+          : []),
+      ]
+        .filter(Boolean)
+        .join("\n"),
       mediaUrl: message.attachments.find((attachment) => attachment.url)?.url ?? null,
       ...(attachments.length ? { attachments } : {}),
       ...(!isDirect && message.isMention ? { mentionsBot: true } : {}),

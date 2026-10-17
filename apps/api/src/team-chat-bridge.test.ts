@@ -134,6 +134,131 @@ describe("team chat bridge", () => {
     );
   });
 
+  it.each(["mention", "ambient"] as const)(
+    "waits for file storage before reconciling a %s message",
+    async (kind) => {
+      const conversation = {
+        id: "conversation-1",
+        provider: "slack",
+        spaceId: "space-1",
+        botId: "bot-1",
+        userId: "owner-1",
+        conversationId: "slack:C1:",
+        thread: { id: "thread-1" },
+        automatedSenderPolicies: {},
+      };
+      let record: Record<string, unknown> | undefined;
+      const prisma = {
+        bot: {
+          findFirst: vi.fn(async () => ({ teamChatAmbientEnabled: true, teamChatRules: "" })),
+        },
+        externalConversation: { upsert: vi.fn(async () => conversation) },
+        externalMessage: {
+          upsert: vi.fn(async ({ create }: { create: Record<string, unknown> }) => {
+            record = {
+              ...create,
+              id: "external-1",
+              threadMessageId: null,
+              createdAt: new Date(0),
+              externalConversationId: conversation.id,
+              externalConversation: conversation,
+            };
+            return record;
+          }),
+          update: vi.fn(async ({ data }: { data: Record<string, unknown> }) => {
+            Object.assign(record ?? {}, data);
+          }),
+          updateMany: vi.fn(
+            async ({
+              where,
+              data,
+            }: {
+              where: Record<string, unknown>;
+              data: Record<string, unknown>;
+            }) => {
+              if (record?.status !== where.status) return { count: 0 };
+              Object.assign(record ?? {}, data);
+              return { count: 1 };
+            },
+          ),
+          findMany: vi.fn(async ({ where }: { where: Record<string, unknown> }) => {
+            if (!record || record.status !== where.status) return [];
+            if (where.threadMessageId && record.threadMessageId === null) return [];
+            return [{ ...record }];
+          }),
+        },
+        run: { findMany: vi.fn(async () => []) },
+      } as unknown as PrismaClient;
+      let finishStorage!: () => void;
+      let storageStarted!: () => void;
+      const blocked = new Promise<void>((resolve) => {
+        finishStorage = resolve;
+      });
+      const started = new Promise<void>((resolve) => {
+        storageStarted = resolve;
+      });
+      const judge = { decide: vi.fn(async () => ({ act: true })) };
+      const bridge = new TeamChatBridge({
+        prisma,
+        events: {
+          sendUserMessage: vi.fn(async () => ({
+            messageId: "transcript-1",
+            runId: null,
+            seq: 1,
+            taskId: null,
+          })),
+        },
+        storeAttachment: vi.fn(async () => {
+          storageStarted();
+          await blocked;
+          return { id: "file-1", name: "report.pdf", mimeType: "application/pdf", size: 3 };
+        }),
+        jobs: { enqueue: vi.fn() },
+        send: vi.fn(),
+        judge,
+        providerId: "slack",
+        botId: "bot-1",
+        ambientDebounceMs: 0,
+      });
+      const internals = bridge as unknown as {
+        target: { id: string };
+        queue(message: unknown): Promise<void>;
+      };
+      internals.target = { ...conversation, id: "bot-1" };
+      const queue = vi.spyOn(internals, "queue").mockResolvedValue();
+      const receiving = bridge.receive({
+        eventId: "Ev-files",
+        workspaceId: "T1",
+        kind,
+        conversationKey: "C1",
+        conversationId: "slack:C1:",
+        senderId: "U1",
+        senderName: "Ada",
+        content: "Review this",
+        attachments: [
+          {
+            name: "report.pdf",
+            mimeType: "application/pdf",
+            fetch: async () => new Uint8Array([1, 2, 3]),
+          },
+        ],
+      });
+      try {
+        await started;
+        await bridge.reconcileOnce();
+        expect(queue).not.toHaveBeenCalled();
+        expect(judge.decide).not.toHaveBeenCalled();
+      } finally {
+        finishStorage();
+        await receiving;
+      }
+      expect(queue).toHaveBeenCalledWith(
+        expect.objectContaining({ threadMessageId: "transcript-1" }),
+      );
+      expect(judge.decide).toHaveBeenCalledTimes(kind === "ambient" ? 1 : 0);
+    },
+  );
+
   it("stores inbound files on the transcript message and marks the ones it could not keep", async () => {
     const prisma = {
       externalConversation: {

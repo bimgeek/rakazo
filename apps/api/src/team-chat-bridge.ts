@@ -725,6 +725,7 @@ export class TeamChatBridge {
     const received = await this.deps.prisma.externalMessage.findMany({
       where: {
         status: "received",
+        threadMessageId: { not: null },
         OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: now } }],
         externalConversation: {
           provider: this.deps.providerId,
@@ -858,6 +859,7 @@ export class TeamChatBridge {
     const observed = await this.deps.prisma.externalMessage.findMany({
       where: {
         status: "observed",
+        threadMessageId: { not: null },
         externalConversation: {
           provider: this.deps.providerId,
           botId: target.id,

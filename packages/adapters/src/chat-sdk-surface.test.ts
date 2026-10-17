@@ -11,6 +11,7 @@ import {
   providerOfThreadId,
 } from "./chat-sdk-surface.js";
 import { enrichSlackTeamRoom } from "./messaging-platforms.js";
+import { toTeamChatInbound } from "./team-chat-messaging.js";
 
 const context: AdapterContext = {
   operationId: "op-1",
@@ -242,6 +243,32 @@ describe("ChatSdkMessagingSurface inbound", () => {
     ]);
     await expect(event.attachments?.[0]?.fetch()).resolves.toEqual(new Uint8Array([1, 2, 3]));
   });
+
+  it.each([false, true])(
+    "keeps URL-only files beside fetchable files (first: %s)",
+    async (first) => {
+      const { surface, events } = createSurface();
+      const files = [
+        { name: "private.png", url: "https://files.example.test/private", authenticated: true },
+        { name: "public.png", url: "https://cdn.example.test/public.png" },
+      ];
+      await surface.handleWebhook(
+        "mock",
+        webhookRequest({
+          threadId: "mock:C1:1",
+          id: "m-files",
+          text: "see files",
+          files: first ? files.toReversed() : files,
+        }),
+      );
+      const event = events[0];
+      if (event?.type !== "message") throw new Error("expected a message");
+      expect(toTeamChatInbound(event)).toMatchObject({
+        content: "see files\nhttps://cdn.example.test/public.png",
+        attachments: [{ name: "private.png", fetch: expect.any(Function) }],
+      });
+    },
+  );
 
   it("keeps link targets the SDK's plain text drops", async () => {
     const { surface, events } = createSurface();
