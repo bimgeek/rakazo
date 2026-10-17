@@ -121,6 +121,23 @@ describe("ChatSdkMessagingSurface inbound", () => {
     ]);
   });
 
+  it("flags group messages the SDK detects as bot mentions", async () => {
+    const { surface, events } = createSurface();
+    await surface.handleWebhook(
+      "mock",
+      webhookRequest({ threadId: "mock:C1:1", id: "m-1", text: "@mock-bot ship it?" }),
+    );
+    await surface.handleWebhook(
+      "mock",
+      webhookRequest({ threadId: "mock:C1:1", id: "m-2", text: "ship it?" }),
+    );
+
+    expect(events.map((event) => event.type === "message" && event.mentionsBot)).toEqual([
+      true,
+      undefined,
+    ]);
+  });
+
   it("never surfaces the bot's own messages", async () => {
     const { surface, events } = createSurface();
     const response = await surface.handleWebhook(
