@@ -11,6 +11,8 @@ import {
   attachWorkspaceFileToThread,
   currentTurnFilesInstruction,
   materializeCurrentTurnFiles,
+  materializeRecentThreadFiles,
+  recentThreadFilesInstruction,
 } from "./thread-artifacts.js";
 
 describe("current-turn thread files", () => {
@@ -321,5 +323,79 @@ describe("current-turn thread files", () => {
     expect(files).toEqual([
       { name: "photo.png", mimeType: "image/png", size: 4, path: "attachments/image-1.png" },
     ]);
+  });
+});
+
+describe("recent thread files", () => {
+  it("copies attachments from earlier turns the run is answering, skipping unreadable ones", async () => {
+    const findMany = vi.fn(async ({ where }: { where: { id: { in: string[] } } }) =>
+      where.id.in[0] === "image-1"
+        ? [
+            {
+              id: "image-1",
+              name: "screenshot.png",
+              mimeType: "image/png",
+              size: 3,
+              storageKey: "stored-image-1",
+            },
+          ]
+        : [],
+    );
+    const writeFile = vi.fn().mockResolvedValue(undefined);
+    const context = {
+      operationId: "run-1",
+      traceId: "run-1",
+      spaceId: "space-1",
+      userId: "user-1",
+      botId: "bot-1",
+      signal: new AbortController().signal,
+    };
+    const files = await materializeRecentThreadFiles(
+      {
+        prisma: { artifact: { findMany } } as unknown as PrismaClient,
+        artifacts: {
+          get: vi.fn().mockResolvedValue(new Uint8Array([1, 2, 3])),
+        } as unknown as ArtifactStore,
+        sandbox: { writeFile } as unknown as SandboxProvider,
+      },
+      [
+        { id: "transcript-image", role: "user" },
+        { id: "reply", role: "assistant" },
+        { id: "transcript-request", role: "user" },
+        { id: "run-message", role: "user" },
+      ],
+      [
+        {
+          id: "transcript-image",
+          blocks: [
+            { kind: "text", text: "here it is" },
+            { kind: "image", artifactId: "image-1", name: "screenshot.png", mimeType: "image/png" },
+            { kind: "image", artifactId: "deleted-1", name: "old.png", mimeType: "image/png" },
+          ],
+        },
+        { id: "reply", blocks: [{ kind: "text", text: "I can see it" }] },
+        { id: "transcript-request", blocks: [{ kind: "text", text: "put it in Linear" }] },
+        { id: "run-message", blocks: [{ kind: "text", text: "Slack message: put it in Linear" }] },
+      ],
+      {
+        context,
+        computer: { id: "computer-1", kind: "fake", providerRef: "fake-1" } as ComputerRef,
+        computerMode: "team",
+        maxTurns: 3,
+      },
+    );
+
+    expect(writeFile).toHaveBeenCalledOnce();
+    expect(writeFile).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "computer-1" }),
+      { path: "bots/bot-1/attachments/image-1.png", content: new Uint8Array([1, 2, 3]) },
+      context,
+    );
+    expect(recentThreadFilesInstruction(files)).toBe(
+      [
+        "Files attached earlier in this conversation are also on your computer:",
+        '- "screenshot.png" (image/png, 3 bytes): "attachments/image-1.png"',
+      ].join("\n"),
+    );
   });
 });
