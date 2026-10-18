@@ -134,6 +134,157 @@ describe("team chat bridge", () => {
     );
   });
 
+  it.each(["mention", "ambient"] as const)(
+    "waits for file storage before reconciling a %s message",
+    async (kind) => {
+      const conversation = {
+        id: "conversation-1",
+        provider: "slack",
+        spaceId: "space-1",
+        botId: "bot-1",
+        userId: "owner-1",
+        conversationId: "slack:C1:",
+        thread: { id: "thread-1" },
+        automatedSenderPolicies: {},
+      };
+      let record: Record<string, unknown> | undefined;
+      let releaseUpsert!: () => void;
+      let upsertCommitted!: () => void;
+      const upsertResponse = new Promise<void>((resolve) => {
+        releaseUpsert = resolve;
+      });
+      const committed = new Promise<void>((resolve) => {
+        upsertCommitted = resolve;
+      });
+      const prisma = {
+        bot: {
+          findFirst: vi.fn(async () => ({ teamChatAmbientEnabled: true, teamChatRules: "" })),
+        },
+        externalConversation: { upsert: vi.fn(async () => conversation) },
+        externalMessage: {
+          upsert: vi.fn(async ({ create }: { create: Record<string, unknown> }) => {
+            record = {
+              ...create,
+              id: "external-1",
+              threadMessageId: null,
+              createdAt: new Date(0),
+              externalConversationId: conversation.id,
+              externalConversation: conversation,
+            };
+            upsertCommitted();
+            await upsertResponse;
+            return record;
+          }),
+          update: vi.fn(async ({ data }: { data: Record<string, unknown> }) => {
+            Object.assign(record ?? {}, data);
+          }),
+          updateMany: vi.fn(
+            async ({
+              where,
+              data,
+            }: {
+              where: Record<string, unknown>;
+              data: Record<string, unknown>;
+            }) => {
+              if (record?.status !== where.status) return { count: 0 };
+              Object.assign(record ?? {}, data);
+              return { count: 1 };
+            },
+          ),
+          findMany: vi.fn(async ({ where }: { where: Record<string, unknown> }) => {
+            if (!record) return [];
+            if (where.threadMessageId === null) {
+              const excluded = (where.id as { notIn: string[] }).notIn;
+              const receiving = (where.providerEventId as { notIn: string[] }).notIn;
+              return record.threadMessageId === null &&
+                !excluded.includes(String(record.id)) &&
+                !receiving.includes(String(record.providerEventId))
+                ? [{ ...record }]
+                : [];
+            }
+            if (record.status !== where.status) return [];
+            if (where.threadMessageId && record.threadMessageId === null) return [];
+            return [{ ...record }];
+          }),
+        },
+        run: { findMany: vi.fn(async () => []) },
+      } as unknown as PrismaClient;
+      let finishStorage!: () => void;
+      let storageStarted!: () => void;
+      const blocked = new Promise<void>((resolve) => {
+        finishStorage = resolve;
+      });
+      const started = new Promise<void>((resolve) => {
+        storageStarted = resolve;
+      });
+      const judge = { decide: vi.fn(async () => ({ act: true })) };
+      const bridge = new TeamChatBridge({
+        prisma,
+        events: {
+          sendUserMessage: vi.fn(async () => ({
+            messageId: "transcript-1",
+            runId: null,
+            seq: 1,
+            taskId: null,
+          })),
+        },
+        storeAttachment: vi.fn(async () => {
+          storageStarted();
+          await blocked;
+          return { id: "file-1", name: "report.pdf", mimeType: "application/pdf", size: 3 };
+        }),
+        jobs: { enqueue: vi.fn() },
+        send: vi.fn(),
+        judge,
+        providerId: "slack",
+        botId: "bot-1",
+        ambientDebounceMs: 0,
+      });
+      const internals = bridge as unknown as {
+        target: { id: string };
+        queue(message: unknown): Promise<void>;
+      };
+      internals.target = { ...conversation, id: "bot-1" };
+      const queue = vi.spyOn(internals, "queue").mockResolvedValue();
+      const receiving = bridge.receive({
+        eventId: "Ev-files",
+        workspaceId: "T1",
+        kind,
+        conversationKey: "C1",
+        conversationId: "slack:C1:",
+        senderId: "U1",
+        senderName: "Ada",
+        content: "Review this",
+        attachments: [
+          {
+            name: "report.pdf",
+            mimeType: "application/pdf",
+            fetch: async () => new Uint8Array([1, 2, 3]),
+          },
+        ],
+      });
+      try {
+        await committed;
+        await bridge.reconcileOnce();
+        expect(queue).not.toHaveBeenCalled();
+        expect(judge.decide).not.toHaveBeenCalled();
+        releaseUpsert();
+        await started;
+        await bridge.reconcileOnce();
+        expect(queue).not.toHaveBeenCalled();
+        expect(judge.decide).not.toHaveBeenCalled();
+      } finally {
+        releaseUpsert();
+        finishStorage();
+        await receiving;
+      }
+      expect(queue).toHaveBeenCalledWith(
+        expect.objectContaining({ threadMessageId: "transcript-1" }),
+      );
+      expect(judge.decide).toHaveBeenCalledTimes(kind === "ambient" ? 1 : 0);
+    },
+  );
+
   it("stores inbound files on the transcript message and marks the ones it could not keep", async () => {
     const prisma = {
       externalConversation: {
@@ -240,19 +391,34 @@ describe("team chat bridge", () => {
       const findFirst = vi.fn(async (_query: unknown) =>
         input.knownThread || rows.size > 0 ? { id: "root" } : null,
       );
+      const conversation = {
+        id: "conversation-1",
+        provider: "slack",
+        spaceId: "space-1",
+        botId: "bot-1",
+        userId: "owner-1",
+        thread: { id: "thread-1" },
+      };
       const prisma = {
-        externalConversation: {
-          upsert: vi.fn(async () => ({
-            id: "conversation-1",
-            provider: "slack",
-            spaceId: "space-1",
-            botId: "bot-1",
-            userId: "owner-1",
-            thread: { id: "thread-1" },
-          })),
-        },
+        artifact: { findMany: vi.fn(async () => []) },
+        externalConversation: { upsert: vi.fn(async () => conversation) },
         externalMessage: {
           findFirst,
+          findMany: vi.fn(
+            async ({
+              where,
+            }: {
+              where: { id: { notIn: string[] }; providerEventId: { notIn: string[] } };
+            }) =>
+              [...rows.values()]
+                .filter(
+                  (row) =>
+                    row.threadMessageId === null &&
+                    !where.id.notIn.includes(String(row.id)) &&
+                    !where.providerEventId.notIn.includes(String(row.providerEventId)),
+                )
+                .map((row) => ({ ...row, externalConversation: conversation })),
+          ),
           upsert,
           update,
           updateMany: vi.fn(async () => ({ count: 1 })),
@@ -355,6 +521,46 @@ describe("team chat bridge", () => {
       });
       expect(sendUserMessage.mock.calls[2]?.[0]).toMatchObject({
         blocks: [{ kind: "text", text: "@Chief is this a LOD issue?" }],
+      });
+    });
+
+    it("keeps recovery out of history writes before the upsert response arrives", async () => {
+      const { bridge, upsert, storeAttachment, sendUserMessage } = setup({
+        knownThread: false,
+        history: [earlier("100.1", ["a.png"])],
+      });
+      let release!: () => void;
+      let committed!: () => void;
+      const response = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const saved = new Promise<void>((resolve) => {
+        committed = resolve;
+      });
+      const write = upsert.getMockImplementation()!;
+      upsert.mockImplementationOnce(async (input) => {
+        const row = await write(input);
+        committed();
+        await response;
+        return row;
+      });
+      const receiving = bridge.receive(mention, { queueAgent: false });
+      try {
+        await saved;
+        await (
+          bridge as unknown as { mirrorMissingMessages(): Promise<void> }
+        ).mirrorMissingMessages();
+        expect(sendUserMessage).not.toHaveBeenCalled();
+        expect(storeAttachment).not.toHaveBeenCalled();
+      } finally {
+        release();
+        await receiving;
+      }
+      expect(storeAttachment).toHaveBeenCalledOnce();
+      expect(sendUserMessage.mock.calls[0]?.[0]).toMatchObject({
+        blocks: expect.arrayContaining([
+          { kind: "image", artifactId: "artifact-a.png", name: "a.png", mimeType: "image/png" },
+        ]),
       });
     });
 
@@ -2354,82 +2560,96 @@ describe("team chat bridge", () => {
     expect(records[0]).toMatchObject({ status: "delivered" });
   });
 
-  it("repairs previously observed messages that do not have transcript rows", async () => {
-    const conversation = {
-      id: "conversation-legacy",
-      provider: "slack",
-      workspaceId: "T-1",
-      conversationId: "C-1",
-      spaceId: "space-1",
-      botId: "bot-1",
-      userId: "owner-1",
-      thread: { id: "thread-legacy" },
-    };
-    const record = {
-      id: "external-legacy",
-      providerEventId: "Ev-legacy",
-      senderName: "Pat",
-      content: "This ordinary message was already observed.",
-      threadMessageId: null as string | null,
-      status: "ignored",
-      externalConversation: conversation,
-    };
-    const sendUserMessage = vi.fn(async () => ({
-      messageId: "message-visible",
-      seq: 1,
-      taskId: null,
-      runId: null,
-    }));
-    const prisma = {
-      artifact: { findMany: vi.fn(async () => []) },
-      bot: {
-        findFirst: vi.fn(async () => ({
-          id: "bot-1",
-          spaceId: "space-1",
-          userId: "owner-1",
-          name: "Arthur",
-          modelProvider: null,
-          modelId: null,
-        })),
-      },
-      externalMessage: {
-        findMany: vi.fn(async ({ where }: { where: Record<string, unknown> }) => {
-          if (where.threadMessageId === null && record.threadMessageId === null) {
-            return [{ ...record, externalConversation: conversation }];
-          }
-          return [];
+  it.each(["startup", "write", "link"] as const)(
+    "repairs missing transcript messages after %s",
+    async (failure) => {
+      const conversation = {
+        id: "conversation-legacy",
+        provider: "slack",
+        workspaceId: "T-1",
+        conversationId: "C-1",
+        spaceId: "space-1",
+        botId: "bot-1",
+        userId: "owner-1",
+        thread: { id: "thread-legacy" },
+      };
+      const record = {
+        id: "external-legacy",
+        providerEventId: "Ev-legacy",
+        senderName: "Pat",
+        content: "This ordinary message was already observed.",
+        threadMessageId: null as string | null,
+        status: "ignored",
+        externalConversation: conversation,
+      };
+      const sendUserMessage = vi.fn(async () => ({
+        messageId: "message-visible",
+        seq: 1,
+        taskId: null,
+        runId: null,
+      }));
+      const prisma = {
+        artifact: { findMany: vi.fn(async () => []) },
+        bot: {
+          findFirst: vi.fn(async () => ({
+            id: "bot-1",
+            spaceId: "space-1",
+            userId: "owner-1",
+            name: "Arthur",
+            modelProvider: null,
+            modelId: null,
+          })),
+        },
+        externalMessage: {
+          findMany: vi.fn(async ({ where }: { where: Record<string, unknown> }) => {
+            if (where.threadMessageId === null && record.threadMessageId === null) {
+              return [{ ...record, externalConversation: conversation }];
+            }
+            return [];
+          }),
+          update: vi.fn(async ({ data }: { data: { threadMessageId?: string } }) => {
+            if (data.threadMessageId) record.threadMessageId = data.threadMessageId;
+            return record;
+          }),
+          updateMany: vi.fn(async () => ({ count: 0 })),
+        },
+        run: { findMany: vi.fn(async () => []) },
+      } as unknown as PrismaClient;
+
+      const bridge = new TeamChatBridge({
+        prisma,
+        events: { sendUserMessage },
+        jobs: { enqueue: vi.fn() },
+        send: vi.fn(),
+        providerId: "slack",
+        botId: "bot-1",
+        reconcileIntervalMs: 60_000,
+      });
+
+      if (failure === "startup") {
+        await bridge.start();
+        await bridge.stop();
+      } else {
+        const internals = bridge as unknown as { target: { id: string } };
+        internals.target = { id: "bot-1" };
+        if (failure === "write") sendUserMessage.mockRejectedValueOnce(new Error("write failed"));
+        else
+          vi.mocked(prisma.externalMessage.update).mockRejectedValueOnce(new Error("link failed"));
+        await expect(bridge.reconcileOnce()).rejects.toThrow(`${failure} failed`);
+        expect(record.threadMessageId).toBeNull();
+        await bridge.reconcileOnce();
+      }
+
+      expect(sendUserMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          threadId: "thread-legacy",
+          blocks: [{ kind: "text", text: "This ordinary message was already observed." }],
+          createRun: false,
         }),
-        update: vi.fn(async ({ data }: { data: { threadMessageId?: string } }) => {
-          if (data.threadMessageId) record.threadMessageId = data.threadMessageId;
-          return record;
-        }),
-        updateMany: vi.fn(async () => ({ count: 0 })),
-      },
-      run: { findMany: vi.fn(async () => []) },
-    } as unknown as PrismaClient;
-
-    const bridge = new TeamChatBridge({
-      prisma,
-      events: { sendUserMessage },
-      jobs: { enqueue: vi.fn() },
-      send: vi.fn(),
-      providerId: "slack",
-      botId: "bot-1",
-      reconcileIntervalMs: 60_000,
-    });
-
-    await bridge.start();
-    await bridge.stop();
-
-    expect(sendUserMessage).toHaveBeenCalledWith(
-      expect.objectContaining({
-        threadId: "thread-legacy",
-        blocks: [{ kind: "text", text: "This ordinary message was already observed." }],
-        createRun: false,
-      }),
-    );
-    expect(record.threadMessageId).toBe("message-visible");
-  });
+      );
+      expect(record.threadMessageId).toBe("message-visible");
+    },
+  );
   it("does not reopen deliveries finalized as unconfirmed", async () => {
     const update = vi.fn();
     const updateMany = vi.fn(async () => ({ count: 0 }));

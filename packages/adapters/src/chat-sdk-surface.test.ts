@@ -11,6 +11,7 @@ import {
   providerOfThreadId,
 } from "./chat-sdk-surface.js";
 import { enrichSlackTeamRoom } from "./messaging-platforms.js";
+import { toTeamChatInbound } from "./team-chat-messaging.js";
 
 const context: AdapterContext = {
   operationId: "op-1",
@@ -241,6 +242,62 @@ describe("ChatSdkMessagingSurface inbound", () => {
       { name: "screen.png", mimeType: "image/png", size: 3, fetch: expect.any(Function) },
     ]);
     await expect(event.attachments?.[0]?.fetch()).resolves.toEqual(new Uint8Array([1, 2, 3]));
+  });
+
+  it.each([false, true])(
+    "keeps URL-only files beside fetchable files (first: %s)",
+    async (first) => {
+      const { surface, events } = createSurface();
+      const files = [
+        { name: "private.png", url: "https://files.example.test/private", authenticated: true },
+        { name: "public.png", url: "https://cdn.example.test/public.png" },
+      ];
+      await surface.handleWebhook(
+        "mock",
+        webhookRequest({
+          threadId: "mock:C1:1",
+          id: "m-files",
+          text: "see files",
+          files: first ? files.toReversed() : files,
+        }),
+      );
+      const event = events[0];
+      if (event?.type !== "message") throw new Error("expected a message");
+      expect(toTeamChatInbound(event)).toMatchObject({
+        content: "see files\nhttps://cdn.example.test/public.png",
+        attachments: [{ name: "private.png", fetch: expect.any(Function) }],
+      });
+    },
+  );
+
+  it("keeps link targets the SDK's plain text drops", async () => {
+    const { surface, events } = createSurface();
+    await surface.handleWebhook(
+      "mock",
+      webhookRequest({
+        threadId: "mock:Duser:1",
+        id: "m-1",
+        text: "see [example.test/projects/…](https://example.test/projects/abc) and [https://example.test/](https://example.test/) or [example.test/x](https://example.test/x) or [example.test/](https://example.test/) or [example.test](https://example.test/)",
+      }),
+    );
+
+    expect(events[0]).toMatchObject({
+      content:
+        "see example.test/projects/… (https://example.test/projects/abc) and https://example.test/ or example.test/x or example.test/ or example.test",
+    });
+  });
+
+  it.each([
+    "# Heading\n\n*literal asterisks* and `backticks`",
+    "# Heading\n\n*literal asterisks* and `backticks` [https://example.test/](https://example.test/)",
+  ])("keeps the adapter's original text when no link target is added: %s", async (text) => {
+    const { surface, events } = createSurface();
+    await surface.handleWebhook(
+      "mock",
+      webhookRequest({ threadId: "mock:Duser:1", id: "m-1", text }),
+    );
+
+    expect(events[0]).toMatchObject({ content: text });
   });
 
   it("flags group messages the SDK detects as bot mentions", async () => {
