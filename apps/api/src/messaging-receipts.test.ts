@@ -1,4 +1,5 @@
 import type { AdapterContext, MessagingPlatformDescriptor } from "@rakazo/adapter-kit";
+import { getLogger } from "@rakazo/logging";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createMessagingReceipts } from "./messaging-receipts.js";
 
@@ -19,7 +20,7 @@ function fakeMessaging() {
   };
 }
 
-const unanswered = async () => false;
+const unhandled = async () => false;
 
 describe("createMessagingReceipts", () => {
   beforeEach(() => {
@@ -32,7 +33,7 @@ describe("createMessagingReceipts", () => {
 
   it("sends typing bubbles immediately", () => {
     const messaging = fakeMessaging();
-    createMessagingReceipts(messaging).acknowledge("sendblue:dm-1", "h-1", unanswered);
+    createMessagingReceipts(messaging).acknowledge("sendblue:dm-1", "h-1", unhandled);
 
     expect(
       messaging.acknowledge.mock.calls.map(([threadId, handle]) => [threadId, handle]),
@@ -41,7 +42,7 @@ describe("createMessagingReceipts", () => {
 
   it("reacts only once the reply is a minute late", async () => {
     const messaging = fakeMessaging();
-    createMessagingReceipts(messaging).acknowledge(SLACK_THREAD, SLACK_HANDLE, unanswered);
+    createMessagingReceipts(messaging).acknowledge(SLACK_THREAD, SLACK_HANDLE, unhandled);
 
     await vi.advanceTimersByTimeAsync(59_999);
     expect(messaging.acknowledge.mock.calls).toEqual([]);
@@ -55,7 +56,7 @@ describe("createMessagingReceipts", () => {
     const messaging = fakeMessaging();
     const receipts = createMessagingReceipts(messaging);
     receipts.acknowledge(SLACK_THREAD, SLACK_HANDLE, async () => true);
-    receipts.acknowledge("slack:C1:1700000000.000200", "1700000000.000200", unanswered);
+    receipts.acknowledge("slack:C1:1700000000.000200", "1700000000.000200", unhandled);
 
     await vi.advanceTimersByTimeAsync(60_000);
     expect(
@@ -63,25 +64,52 @@ describe("createMessagingReceipts", () => {
     ).toEqual([["slack:C1:1700000000.000200", "1700000000.000200"]]);
   });
 
-  it("drops pending reactions on stop", async () => {
+  it("sends nothing once stopped", async () => {
     const messaging = fakeMessaging();
     const receipts = createMessagingReceipts(messaging);
-    receipts.acknowledge(SLACK_THREAD, SLACK_HANDLE, unanswered);
+    receipts.acknowledge(SLACK_THREAD, SLACK_HANDLE, unhandled);
+    let releaseCheck = () => {};
+    receipts.acknowledge(
+      "slack:C1:1700000000.000200",
+      "1700000000.000200",
+      () => new Promise((resolve) => (releaseCheck = () => resolve(false))),
+    );
+    await vi.advanceTimersByTimeAsync(60_000);
+    messaging.acknowledge.mockClear();
+    receipts.acknowledge("slack:C1:1700000000.000300", "1700000000.000300", unhandled);
     receipts.stop();
-    receipts.acknowledge("sendblue:dm-1", "h-1", unanswered);
+    releaseCheck();
+    receipts.acknowledge("sendblue:dm-1", "h-1", unhandled);
 
     await vi.advanceTimersByTimeAsync(60_000);
-    expect(messaging.acknowledge.mock.calls.map(([threadId]) => threadId)).toEqual([
-      "sendblue:dm-1",
+    expect(messaging.acknowledge).not.toHaveBeenCalled();
+  });
+
+  it("logs a failed receipt instead of throwing", async () => {
+    const error = vi.spyOn(getLogger(), "error");
+    const messaging = fakeMessaging();
+    messaging.acknowledge.mockRejectedValue(new Error("missing_scope"));
+    const receipts = createMessagingReceipts(messaging);
+    receipts.acknowledge("sendblue:dm-1", "h-1", unhandled);
+    receipts.acknowledge(SLACK_THREAD, SLACK_HANDLE, unhandled);
+    receipts.acknowledge("slack:C1:1700000000.000200", "1700000000.000200", async () => {
+      throw new Error("database unavailable");
+    });
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(error.mock.calls.map(([, cause]) => (cause as Error).message)).toEqual([
+      "missing_scope",
+      "missing_scope",
+      "database unavailable",
     ]);
   });
 
   it("sends nothing for platforms without a receipt", async () => {
     const messaging = fakeMessaging();
     const receipts = createMessagingReceipts(messaging);
-    receipts.acknowledge("telegram:42", "7", unanswered);
-    receipts.acknowledge("mystery:1", "1", unanswered);
-    receipts.acknowledge("sendblue:dm-1", "h-1", unanswered);
+    receipts.acknowledge("telegram:42", "7", unhandled);
+    receipts.acknowledge("mystery:1", "1", unhandled);
+    receipts.acknowledge("sendblue:dm-1", "h-1", unhandled);
 
     await vi.advanceTimersByTimeAsync(60_000);
     expect(messaging.acknowledge.mock.calls.map(([threadId]) => threadId)).toEqual([
@@ -98,7 +126,7 @@ describe("createMessagingReceipts", () => {
       return controller.signal;
     });
     const messaging = fakeMessaging();
-    createMessagingReceipts(messaging).acknowledge(SLACK_THREAD, SLACK_HANDLE, unanswered);
+    createMessagingReceipts(messaging).acknowledge(SLACK_THREAD, SLACK_HANDLE, unhandled);
 
     await vi.advanceTimersByTimeAsync(60_000);
     expect(messaging.acknowledge.mock.calls[0]![2].signal.aborted).toBe(false);

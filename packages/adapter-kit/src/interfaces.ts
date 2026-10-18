@@ -398,9 +398,8 @@ export interface MessagingSurface {
   /** Resolve (or create) the 1:1 thread for a provider address. */
   openDirectThread(provider: string, address: string, context: AdapterContext): Promise<string>;
   /**
-   * Best-effort receipt for an inbound message (typing bubbles or a
-   * reaction). Cosmetic: never gates delivery, and no-ops on platforms
-   * without a receipt.
+   * Best-effort receipt for inbound message `handle`. Never gates delivery;
+   * no-ops on platforms without a receipt.
    */
   acknowledge(threadId: string, handle: string, context: AdapterContext): Promise<void>;
   /**

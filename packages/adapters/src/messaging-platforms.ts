@@ -123,8 +123,7 @@ export function messagingPlatformsFromEnv(
       botToken: env.slackBotToken,
       signingSecret: env.slackSigningSecret,
     });
-    // A replayed inbound (restart, second API process) reacts again, and
-    // Slack rejects a duplicate reaction although the receipt is in place.
+    // Slack's reactions.add fails with already_reacted when a replayed inbound reacts twice.
     const addReaction = adapter.addReaction.bind(adapter);
     Object.assign(adapter, {
       addReaction: (threadId, messageId, emoji) =>

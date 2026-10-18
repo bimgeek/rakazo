@@ -18,7 +18,6 @@ const slackResults: Record<string, () => Record<string, unknown>> = {
   "reactions.add": () => slack.reactionResult,
 };
 
-// Exercise the pinned adapter and Web API client; replace only their HTTP transport.
 vi.mock("@chat-adapter/slack", async (importOriginal) => {
   const actual = await importOriginal<typeof SlackAdapterModule>();
   return {

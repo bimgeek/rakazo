@@ -16,6 +16,7 @@ import {
   redeemMessagingLinkCode,
 } from "@rakazo/db";
 import { getLogger } from "@rakazo/logging";
+import type { MessagingReceipts } from "./messaging-receipts.js";
 import {
   MESSAGE_ROUTING_REARMED_REASON,
   MESSAGE_ROUTING_REASON,
@@ -42,7 +43,7 @@ export interface MessagingInboundDeps {
    */
   openSignup: boolean;
   signupPolicy: SignupPolicyEnv;
-  acknowledge?: (threadId: string, handle: string, answered: () => Promise<boolean>) => void;
+  acknowledge?: MessagingReceipts["acknowledge"];
 }
 
 type IdentityRow = {

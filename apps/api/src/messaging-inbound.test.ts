@@ -5,6 +5,7 @@ import {
   teamChatSenderCanWakeMessageRoutines,
   wakeMessageRoutines,
 } from "./messaging-inbound.js";
+import type { MessagingReceipts } from "./messaging-receipts.js";
 import { inboundDeliveryClientNonce, messagingWakeIdempotencyKey } from "./webhook-inbound.js";
 
 const signupPolicy = { signupsEnabled: undefined, signupAllowlist: undefined };
@@ -42,9 +43,7 @@ function createDeps(
   );
   const notify = vi.fn(async () => undefined);
   const enqueue = vi.fn(async () => undefined);
-  const acknowledge = vi.fn(
-    (_threadId: string, _handle: string, _answered: () => Promise<boolean>) => undefined,
-  );
+  const acknowledge = vi.fn<MessagingReceipts["acknowledge"]>();
   const runs = new Map<string, { messagingMirroredAt: Date | null }>([
     ["run-1", { messagingMirroredAt: null }],
   ]);
@@ -597,15 +596,17 @@ describe("inbound receipt", () => {
     ]);
   });
 
-  it("reports the DM answered once its run's reply is mirrored out", async () => {
-    const deps = createDeps();
+  it("reports the DM handled once its own run's reply is mirrored out", async () => {
+    const deps = createDeps({ sendResult: { messageId: "msg-2", runId: "run-2", seq: 3 } });
+    deps.runs.set("run-2", { messagingMirroredAt: null });
     const handle = createMessagingInboundHandler(deps);
     await handle(dmEvent);
-    const answered = deps.acknowledge.mock.calls[0]![2];
+    const handled = deps.acknowledge.mock.calls[0]![2];
 
-    await expect(answered()).resolves.toBe(false);
     deps.runs.get("run-1")!.messagingMirroredAt = new Date("2026-01-01T00:00:00Z");
-    await expect(answered()).resolves.toBe(true);
+    await expect(handled()).resolves.toBe(false);
+    deps.runs.get("run-2")!.messagingMirroredAt = new Date("2026-01-01T00:00:00Z");
+    await expect(handled()).resolves.toBe(true);
   });
 
   it("stays silent when the message produced no run", async () => {

@@ -9,6 +9,7 @@ import { userTurnMessageForRun } from "@rakazo/core";
 import type { PrismaClient } from "@rakazo/db";
 import { describe, expect, it, vi } from "vitest";
 import { materializeCurrentTurnFiles } from "../../../packages/adapters/src/thread-artifacts.js";
+import type { MessagingReceipts } from "./messaging-receipts.js";
 import {
   TeamChatBridge,
   teamChatAmbientPrompt,
@@ -2779,7 +2780,7 @@ describe("team chat bridge", () => {
 });
 
 describe("team chat bridge receipt", () => {
-  type Acknowledge = (threadId: string, handle: string, answered: () => Promise<boolean>) => void;
+  type Acknowledge = MessagingReceipts["acknowledge"];
 
   function receiptBridge(acknowledge: Acknowledge) {
     const rows = new Map<string, Record<string, unknown>>();
@@ -2884,15 +2885,23 @@ describe("team chat bridge receipt", () => {
     ]);
   });
 
-  it("reports the message answered once its reply is delivered", async () => {
+  it("reports the message handled once its reply is delivered or the bridge lets it go", async () => {
     const acknowledge = vi.fn<Acknowledge>();
     const { bridge, rows } = receiptBridge(acknowledge);
 
     await bridge.receive(inbound("1700000000.000500", "mention", "slack:C1:1700000000.000500"));
-    const answered = acknowledge.mock.calls[0]![2];
+    const handled = acknowledge.mock.calls[0]![2];
+    const row = rows.get("external-1700000000.000500")!;
 
-    await expect(answered()).resolves.toBe(false);
-    rows.get("external-1700000000.000500")!.deliveredAt = new Date("2026-01-01T00:00:00Z");
-    await expect(answered()).resolves.toBe(true);
+    await expect(handled()).resolves.toBe(false);
+    row.deliveredAt = new Date("2026-01-01T00:00:00Z");
+    await expect(handled()).resolves.toBe(true);
+    row.deliveredAt = null;
+    for (const status of ["ignored", "cancelled"]) {
+      row.status = status;
+      await expect(handled()).resolves.toBe(true);
+    }
+    row.status = "running";
+    await expect(handled()).resolves.toBe(false);
   });
 });

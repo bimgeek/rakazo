@@ -11,6 +11,7 @@ import { ATTACHMENT_MAX_COUNT, AutomatedSenderPoliciesSchema } from "@rakazo/con
 import { botMessageMaxHops, messageBlockForArtifact, promptTextForAttachments } from "@rakazo/core";
 import type { PrismaClient, ThreadEvents } from "@rakazo/db";
 import { getLogger } from "@rakazo/logging";
+import type { MessagingReceipts } from "./messaging-receipts.js";
 import type { TeamChatEngagementJudge } from "./team-chat-judge.js";
 import {
   MESSAGE_ROUTING_REARMED_REASON,
@@ -65,7 +66,7 @@ interface TeamChatBridgeDeps {
   providerId: string;
   botId: string;
   judge?: TeamChatEngagementJudge;
-  acknowledge?: (threadId: string, handle: string, answered: () => Promise<boolean>) => void;
+  acknowledge?: MessagingReceipts["acknowledge"];
   reconcileIntervalMs?: number;
   ambientDebounceMs?: number;
 }
@@ -307,9 +308,11 @@ export class TeamChatBridge {
       this.deps.acknowledge?.(message.conversationId, message.eventId, async () => {
         const row = await this.deps.prisma.externalMessage.findUnique({
           where: { id: externalMessageId },
-          select: { deliveredAt: true },
+          select: { deliveredAt: true, status: true },
         });
-        return Boolean(row?.deliveredAt);
+        return (
+          Boolean(row?.deliveredAt) || row?.status === "ignored" || row?.status === "cancelled"
+        );
       });
     }
     await this.ensureTranscriptMessage(externalMessage, conversation, message.attachments ?? []);
