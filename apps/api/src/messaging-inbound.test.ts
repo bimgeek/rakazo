@@ -44,9 +44,10 @@ function createDeps(
   const notify = vi.fn(async () => undefined);
   const enqueue = vi.fn(async () => undefined);
   const acknowledge = vi.fn<MessagingReceipts["acknowledge"]>();
-  const runs = new Map<string, { messagingMirroredAt: Date | null }>([
-    ["run-1", { messagingMirroredAt: null }],
+  const runs = new Map<string, { status: string; messagingMirroredAt: Date | null }>([
+    ["run-1", { status: "running", messagingMirroredAt: null }],
   ]);
+  const botReplies: Array<{ id: string; runId: string }> = [];
   const provision = vi.fn(async (request: { provider: string; address: string }) => ({
     provider: request.provider,
     address: request.address,
@@ -124,6 +125,11 @@ function createDeps(
     bot: { findUnique: vi.fn(async () => ({ name: "Chief" })) },
     run: {
       findUnique: vi.fn(async ({ where }: { where: { id: string } }) => runs.get(where.id) ?? null),
+    },
+    message: {
+      findMany: vi.fn(async ({ where }: { where: { runId: string } }) =>
+        botReplies.filter((reply) => reply.runId === where.runId).map(({ id }) => ({ id })),
+      ),
     },
     routine: { findMany: vi.fn(async () => overrides.routines ?? []) },
     thread: { findFirst: vi.fn(async () => ({ id: "thread-1" })) },
@@ -204,6 +210,18 @@ function createDeps(
       ),
     },
     messagingOutbound: {
+      count: vi.fn(
+        async ({
+          where,
+        }: {
+          where: { sourceMessageId: { in: string[] }; status: { not: string } };
+        }) =>
+          outboundRows.filter(
+            (row) =>
+              where.sourceMessageId.in.includes(row.sourceMessageId as string) &&
+              (row.status ?? "pending") !== where.status.not,
+          ).length,
+      ),
       createMany: vi.fn(async ({ data }: { data: Array<Record<string, unknown>> }) => {
         let count = 0;
         for (const item of data) {
@@ -255,6 +273,7 @@ function createDeps(
     signupPolicy,
     acknowledge,
     runs,
+    botReplies,
     sendUserMessage,
     notify,
     enqueue,
@@ -268,6 +287,7 @@ function createDeps(
     enqueue: ReturnType<typeof vi.fn>;
     acknowledge: typeof acknowledge;
     runs: typeof runs;
+    botReplies: typeof botReplies;
     provision: ReturnType<typeof vi.fn>;
     outboundRows: Array<Record<string, unknown>>;
     members: Array<Record<string, unknown>>;
@@ -598,7 +618,7 @@ describe("inbound receipt", () => {
 
   it("reports the DM handled once its own run's reply is mirrored out", async () => {
     const deps = createDeps({ sendResult: { messageId: "msg-2", runId: "run-2", seq: 3 } });
-    deps.runs.set("run-2", { messagingMirroredAt: null });
+    deps.runs.set("run-2", { status: "running", messagingMirroredAt: null });
     const handle = createMessagingInboundHandler(deps);
     await handle(dmEvent);
     const handled = deps.acknowledge.mock.calls[0]![2];
@@ -606,6 +626,37 @@ describe("inbound receipt", () => {
     deps.runs.get("run-1")!.messagingMirroredAt = new Date("2026-01-01T00:00:00Z");
     await expect(handled()).resolves.toBe(false);
     deps.runs.get("run-2")!.messagingMirroredAt = new Date("2026-01-01T00:00:00Z");
+    await expect(handled()).resolves.toBe(true);
+  });
+
+  it("waits for the mirrored reply to actually go out", async () => {
+    const deps = createDeps();
+    const handle = createMessagingInboundHandler(deps);
+    await handle(dmEvent);
+    const handled = deps.acknowledge.mock.calls[0]![2];
+
+    deps.botReplies.push({ id: "reply-1", runId: "run-1" });
+    deps.outboundRows.push({
+      idempotencyKey: "msg:reply-1",
+      sourceMessageId: "reply-1",
+      status: "pending",
+    });
+    deps.runs.get("run-1")!.messagingMirroredAt = new Date("2026-01-01T00:00:00Z");
+    await expect(handled()).resolves.toBe(false);
+
+    deps.outboundRows[0]!.status = "sent";
+    await expect(handled()).resolves.toBe(true);
+  });
+
+  it("treats a failed or cancelled run as handled even before mirroring", async () => {
+    const deps = createDeps();
+    const handle = createMessagingInboundHandler(deps);
+    await handle(dmEvent);
+    const handled = deps.acknowledge.mock.calls[0]![2];
+
+    deps.runs.get("run-1")!.status = "failed";
+    await expect(handled()).resolves.toBe(true);
+    deps.runs.get("run-1")!.status = "cancelled";
     await expect(handled()).resolves.toBe(true);
   });
 

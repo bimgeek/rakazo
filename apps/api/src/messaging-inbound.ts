@@ -151,9 +151,26 @@ async function handleDirectEvent(
     deps.acknowledge?.(event.threadId, event.handle, async () => {
       const run = await deps.prisma.run.findUnique({
         where: { id: runId },
-        select: { messagingMirroredAt: true },
+        select: { status: true, messagingMirroredAt: true },
       });
-      return Boolean(run?.messagingMirroredAt);
+      if (!run) return false;
+      // A failed or cancelled run may never be mirrored, and no reply is coming.
+      if (run.status === "failed" || run.status === "cancelled") return true;
+      if (!run.messagingMirroredAt) return false;
+      // Mirroring only queues the reply in the outbox. It has gone out once
+      // none of this run's queued rows are still waiting to be sent.
+      const replies = await deps.prisma.message.findMany({
+        where: { runId, role: "bot" },
+        select: { id: true },
+      });
+      if (replies.length === 0) return true;
+      const unsent = await deps.prisma.messagingOutbound.count({
+        where: {
+          sourceMessageId: { in: replies.map((reply) => reply.id) },
+          status: { not: "sent" },
+        },
+      });
+      return unsent === 0;
     });
     await deps.jobs.enqueue(runContinueJob(sent.runId)).catch((error) => {
       getLogger().error("messaging inbound run enqueue error", error);
