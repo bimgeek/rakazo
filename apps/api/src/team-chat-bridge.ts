@@ -162,6 +162,7 @@ export class TeamChatBridge {
   /** Same-process wakes still delivering; do not treat their expired leases as orphans. */
   private readonly inFlightRoutineWakes = new Set<string>();
   private readonly mirroring = new Map<string, Promise<void>>();
+  private readonly receiving = new Map<string, number>();
 
   constructor(private readonly deps: TeamChatBridgeDeps) {}
 
@@ -234,6 +235,20 @@ export class TeamChatBridge {
     options?: { queueAgent?: true },
   ): Promise<TeamChatInboundTarget>;
   async receive(
+    message: TeamChatInboundMessage,
+    options?: { queueAgent?: boolean },
+  ): Promise<TeamChatInboundTarget | DeferredTeamChatInboundTarget> {
+    this.receiving.set(message.eventId, (this.receiving.get(message.eventId) ?? 0) + 1);
+    try {
+      return await this.receiveMessage(message, options);
+    } finally {
+      const remaining = (this.receiving.get(message.eventId) ?? 1) - 1;
+      if (remaining) this.receiving.set(message.eventId, remaining);
+      else this.receiving.delete(message.eventId);
+    }
+  }
+
+  private async receiveMessage(
     message: TeamChatInboundMessage,
     options?: { queueAgent?: boolean },
   ): Promise<TeamChatInboundTarget | DeferredTeamChatInboundTarget> {
@@ -450,6 +465,7 @@ export class TeamChatBridge {
         where: {
           threadMessageId: null,
           id: { notIn: [...this.mirroring.keys()] },
+          providerEventId: { notIn: [...this.receiving.keys()] },
           externalConversation: {
             provider: this.deps.providerId,
             botId: target.id,
@@ -466,6 +482,7 @@ export class TeamChatBridge {
       });
       if (messages.length === 0) return;
       for (const message of messages) {
+        if (this.receiving.has(message.providerEventId)) continue;
         await this.ensureTranscriptMessage(message, message.externalConversation);
       }
     }

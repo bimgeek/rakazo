@@ -148,6 +148,14 @@ describe("team chat bridge", () => {
         automatedSenderPolicies: {},
       };
       let record: Record<string, unknown> | undefined;
+      let releaseUpsert!: () => void;
+      let upsertCommitted!: () => void;
+      const upsertResponse = new Promise<void>((resolve) => {
+        releaseUpsert = resolve;
+      });
+      const committed = new Promise<void>((resolve) => {
+        upsertCommitted = resolve;
+      });
       const prisma = {
         bot: {
           findFirst: vi.fn(async () => ({ teamChatAmbientEnabled: true, teamChatRules: "" })),
@@ -163,6 +171,8 @@ describe("team chat bridge", () => {
               externalConversationId: conversation.id,
               externalConversation: conversation,
             };
+            upsertCommitted();
+            await upsertResponse;
             return record;
           }),
           update: vi.fn(async ({ data }: { data: Record<string, unknown> }) => {
@@ -185,7 +195,10 @@ describe("team chat bridge", () => {
             if (!record) return [];
             if (where.threadMessageId === null) {
               const excluded = (where.id as { notIn: string[] }).notIn;
-              return record.threadMessageId === null && !excluded.includes(String(record.id))
+              const receiving = (where.providerEventId as { notIn: string[] }).notIn;
+              return record.threadMessageId === null &&
+                !excluded.includes(String(record.id)) &&
+                !receiving.includes(String(record.providerEventId))
                 ? [{ ...record }]
                 : [];
             }
@@ -251,11 +264,17 @@ describe("team chat bridge", () => {
         ],
       });
       try {
+        await committed;
+        await bridge.reconcileOnce();
+        expect(queue).not.toHaveBeenCalled();
+        expect(judge.decide).not.toHaveBeenCalled();
+        releaseUpsert();
         await started;
         await bridge.reconcileOnce();
         expect(queue).not.toHaveBeenCalled();
         expect(judge.decide).not.toHaveBeenCalled();
       } finally {
+        releaseUpsert();
         finishStorage();
         await receiving;
       }
